@@ -223,21 +223,11 @@ async def safety_check(mint: str, rpc: AsyncClient) -> bool:
                             risk_name = risk.get("name", "Unknown")
                             logger.info(f"RugCheck risk: {risk_name} (level {level})")
                             return False
-                    # Check if token is marked as "Good" or "Warning"
-                    score = data.get("score", 0)
-                    if isinstance(score, str):
-                        try:
-                            score = int(score)
-                        except ValueError:
-                            score = 0
-                    # Some tokens have score 0 if very new — that's okay
                 elif resp.status == 404:
-                    # No report yet — might be too new, but we'll allow it
-                    # since our on-chain checks will catch obvious scams
+                    # No report yet - might be too new, but we'll allow it
                     logger.info(f"No RugCheck report yet for {mint[:8]}... (allowing)")
                 else:
                     logger.warning(f"RugCheck API error: {resp.status}")
-                    # Don't fail on API errors, continue to on-chain checks
     except asyncio.TimeoutError:
         logger.warning(f"RugCheck timeout for {mint[:8]}...")
     except Exception as e:
@@ -250,36 +240,25 @@ async def safety_check(mint: str, rpc: AsyncClient) -> bool:
         if acc.value is None:
             logger.info(f"Token account not found for {mint[:8]}...")
             return False
-        
+
         data = acc.value.data
-        
+
         # Check mint authority (offset 0: 4 bytes option)
         if len(data) < 4:
             return False
         mint_auth_option = int.from_bytes(data[0:4], "little")
         if mint_auth_option != 0:
-            # Mint authority still active — could be LP creation in progress
-            # Some legitimate launches have this for < 1 minute
             logger.info(f"Mint authority not renounced for {mint[:8]}...")
             return False
-        
+
         # Check freeze authority (offset 36: 4 bytes option)
-        # NOTE: Many new tokens temporarily have freeze authority.
-        # You can choose to either:
-        # a) Strict: reject any freeze authority (current behavior)
-        # b) Lenient: only reject if freeze authority is NOT a known burn address
-        # Check freeze authority (offset 36)
-        # OPTION 1: Skip freeze check entirely (riskier but catches more tokens)
-        # OPTION 2: Only reject obvious scam patterns
+        # Skip freeze check - many new tokens have this temporarily
+        # and it's often renounced within minutes
         if len(data) > 39:
             freeze_auth_option = int.from_bytes(data[36:40], "little")
-            # We'll still log it but not fail
             if freeze_auth_option != 0:
                 logger.info(f"Freeze authority present on {mint[:8]}... (proceeding anyway)")
-                # Continue without rejecting
-                    else:
-                        logger.info(f"Freeze authority active on {mint[:8]}... ({freeze_auth_str[:8]}...)")
-                        return False
+
     except Exception as e:
         logger.warning(f"On-chain check error: {e}")
         return False
