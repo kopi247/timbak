@@ -4,7 +4,7 @@ Fully Automated Solana Meme-Sniping Bot
 Uses Jupiter swaps + Jito bundles for stealth execution.
 Smart exit: scaling out, trailing stop, market-cap & time failsafes.
 """
-
+import base58
 import asyncio
 import base64
 import json
@@ -49,11 +49,20 @@ RPC_HTTP = os.getenv("RPC_HTTP", "")
 if not RPC_HTTP:
     raise ValueError("RPC_HTTP not set in .env")
 
-# Wallet
-PRIVATE_KEY_BYTES = [int(b) for b in os.getenv("PRIVATE_KEY", "").split(",") if b]
-if len(PRIVATE_KEY_BYTES) != 64:
-    raise ValueError("Invalid PRIVATE_KEY: must be 64 comma-separated bytes")
-WALLET = Keypair.from_bytes(PRIVATE_KEY_BYTES)
+# Wallet - accepts Base58 private key string
+PRIVATE_KEY_STR = os.getenv("PRIVATE_KEY", "")
+if not PRIVATE_KEY_STR:
+    raise ValueError("PRIVATE_KEY not set in .env")
+
+try:
+    # Decode Base58 private key
+    private_key_bytes = base58.b58decode(PRIVATE_KEY_STR)
+    if len(private_key_bytes) != 64:
+        raise ValueError(f"Invalid key length: {len(private_key_bytes)} bytes (expected 64)")
+    WALLET = Keypair.from_bytes(private_key_bytes)
+    logger.info(f"Wallet loaded: {WALLET.pubkey()}")
+except Exception as e:
+    raise ValueError(f"Invalid PRIVATE_KEY: {e}")
 
 # Jito
 JITO_BUNDLE_URL = os.getenv("JITO_BUNDLE_URL", "https://mainnet.block-engine.jito.wtf/api/v1/bundles")
