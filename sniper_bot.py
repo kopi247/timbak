@@ -47,19 +47,43 @@ RPC_HTTP = os.getenv("RPC_HTTP", "")
 if not RPC_HTTP:
     raise ValueError("RPC_HTTP not set in .env")
 
-# Wallet - accepts Base58 private key string
-PRIVATE_KEY_STR = os.getenv("PRIVATE_KEY", "")
-if not PRIVATE_KEY_STR:
-    raise ValueError("PRIVATE_KEY not set in .env")
-
 try:
-    # Decode Base58 private key using solders
-    from solders.utils import b58decode as b58_decode
-    private_key_bytes = b58_decode(PRIVATE_KEY_STR)
-    if len(private_key_bytes) != 64:
-        raise ValueError(f"Invalid key length: {len(private_key_bytes)} bytes (expected 64)")
-    WALLET = Keypair.from_bytes(private_key_bytes)
-    logger.info(f"Wallet loaded: {WALLET.pubkey()}")
+    # Decode Base58 private key
+    import base64 as b64
+    
+    # Try solders first (newer versions)
+    try:
+        from solders.keypair import Keypair as SoldersKeypair
+        WALLET = SoldersKeypair.from_base58_string(PRIVATE_KEY_STR)
+        logger.info(f"Wallet loaded: {WALLET.pubkey()}")
+    except AttributeError:
+        # Fallback: manual base58 decode
+        # Base58 alphabet
+        ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+        ALPHABET_MAP = {char: idx for idx, char in enumerate(ALPHABET)}
+        
+        def b58decode(s: str) -> bytes:
+            """Decode base58 string to bytes."""
+            # Count leading zeros (1s in base58)
+            leading_zeros = len(s) - len(s.lstrip('1'))
+            
+            # Convert base58 to integer
+            num = 0
+            for char in s:
+                num = num * 58 + ALPHABET_MAP[char]
+            
+            # Convert to bytes (25 or 38 bytes for Solana keys)
+            # Solana private keys are 64 bytes, encoded is ~88 chars
+            combined = num.to_bytes((num.bit_length() + 7) // 8, 'big')
+            
+            # Add back leading zeros
+            return b'\x00' * leading_zeros + combined
+        
+        private_key_bytes = b58decode(PRIVATE_KEY_STR)
+        if len(private_key_bytes) != 64:
+            raise ValueError(f"Invalid key length: {len(private_key_bytes)} bytes (expected 64)")
+        WALLET = Keypair.from_bytes(private_key_bytes)
+        logger.info(f"Wallet loaded: {WALLET.pubkey()}")
 except Exception as e:
     raise ValueError(f"Invalid PRIVATE_KEY: {e}")
 
