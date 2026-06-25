@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Fully Automated Solana Meme-Sniping Bot
-Uses Jupiter swaps + Jito bundles for stealth execution.
+Uses Jupiter API directly + Jito bundles for stealth execution.
 Smart exit: scaling out, trailing stop, market-cap & time failsafes.
 """
-import base58
+
 import asyncio
 import base64
 import json
@@ -26,8 +26,6 @@ from solders.message import MessageV0
 
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.commitment import Confirmed
-
-from jupiter_python_sdk import Jupiter
 
 # ----------------------------------------------------------------------
 # Logging
@@ -55,8 +53,9 @@ if not PRIVATE_KEY_STR:
     raise ValueError("PRIVATE_KEY not set in .env")
 
 try:
-    # Decode Base58 private key
-    private_key_bytes = base58.b58decode(PRIVATE_KEY_STR)
+    # Decode Base58 private key using solders
+    from solders.utils import b58decode as b58_decode
+    private_key_bytes = b58_decode(PRIVATE_KEY_STR)
     if len(private_key_bytes) != 64:
         raise ValueError(f"Invalid key length: {len(private_key_bytes)} bytes (expected 64)")
     WALLET = Keypair.from_bytes(private_key_bytes)
@@ -68,13 +67,16 @@ except Exception as e:
 JITO_BUNDLE_URL = os.getenv("JITO_BUNDLE_URL", "https://mainnet.block-engine.jito.wtf/api/v1/bundles")
 JITO_AUTH_HEADER = {"x-jito-auth": os.getenv("JITO_AUTH_HEADER", "")} if os.getenv("JITO_AUTH_HEADER") else {}
 
-# Official Jito tip wallets (rotate if needed)
+# Official Jito tip wallets
 TIP_ACCOUNTS = [
     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
     "HFqU5x63VTqvQss8hp11i4eVV9bD44FvwYf8KvbtyY81",
     "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
-    "ADaUMid9yfUytqMBgopwjb2DTLS9t2aV7Kf2g6n1oP7x",
 ]
+
+# Jupiter API
+JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
+JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
 
 # Snipe settings
 SNIPE_AMOUNT_SOL = float(os.getenv("SNIPE_AMOUNT_SOL", "0.05"))
@@ -83,21 +85,55 @@ TIP_LAMPORTS = int(os.getenv("TIP_LAMPORTS", "500000"))
 MAX_RUGCHECK_RISK = int(os.getenv("MAX_RUGCHECK_RISK", "0"))
 
 # Exit settings
-TARGET_MULTIPLES = [(2.0, 0.25), (3.0, 0.25), (5.0, 0.25)]  # (mult, fraction)
-TRAILING_STOP_PCT = 20.0   # drop 20% from peak triggers final exit
-STOP_LOSS_FACTOR = 0.4     # exit all if value drops to 0.4x buy price
-MAX_HOLD_SECONDS = 1200    # 20 minutes max hold
-TARGET_MARKET_CAP = 1_000_000  # $1M
+TARGET_MULTIPLES = [(2.0, 0.25), (3.0, 0.25), (5.0, 0.25)]
+TRAILING_STOP_PCT = 20.0
+STOP_LOSS_FACTOR = 0.4
+MAX_HOLD_SECONDS = 1200
+TARGET_MARKET_CAP = 1_000_000
 
-# Token discovery (DexScreener fallback)
+# Token discovery
 DISCOVERY_POLL_SECONDS = 1
 SEEN_TOKENS: set = set()
-
-# Known tokens that are not meme (avoid)
 IGNORE_MINTS = {
     "So11111111111111111111111111111111111111112",
-    "Es9vMFrzaCER9wFRNsmH8zFvwYQzG5C4R6eHn9rxRz8Q",  # USDC
+    "Es9vMFrzaCER9wFRNsmH8zFvwYQzG5C4R6eHn9rxRz8Q",
 }
+
+# WSOL mint
+WSOL_MINT = "So11111111111111111111111111111111111111112"
+
+# ----------------------------------------------------------------------
+# Jupiter API Helpers (no SDK needed)
+# ----------------------------------------------------------------------
+
+async def jupiter_quote(input_mint: str, output_mint: str, amount: int, slippage_bps: int) -> dict:
+    """Get a quote from Jupiter API."""
+    params = {
+        "inputMint": input_mint,
+        "outputMint": output_mint,
+        "amount": str(amount),
+        "slippageBps": str(slippage_bps),
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.get(JUPITER_QUOTE_URL, params=params) as resp:
+            if resp.status != 200:
+                raise Exception(f"Jupiter quote error: {await resp.text()}")
+            return await resp.json()
+
+async def jupiter_swap(quote_response: dict, user_public_key: str) -> dict:
+    """Get swap transaction from Jupiter."""
+    payload = {
+        "quoteResponse": quote_response,
+        "userPublicKey": user_public_key,
+        "wrapAndUnwrapSol": True,
+        "dynamicComputeUnitLimit": True,
+        "prioritizationFeeLamports": "auto",
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(JUPITER_SWAP_URL, json=payload) as resp:
+            if resp.status != 200:
+                raise Exception(f"Jupiter swap error: {await resp.text()}")
+            return await resp.json()
 
 # ----------------------------------------------------------------------
 # Helpers
@@ -105,9 +141,6 @@ IGNORE_MINTS = {
 
 async def create_rpc() -> AsyncClient:
     return AsyncClient(RPC_HTTP)
-
-def create_jupiter() -> Jupiter:
-    return Jupiter("https://quote-api.jup.ag/v6")
 
 def create_tip_transaction(
     wallet: Keypair, tip_account: str, lamports: int, recent_blockhash: str
@@ -150,17 +183,6 @@ async def send_jito_bundle(
                 raise Exception(f"Jito error: {result['error']}")
             return result["result"]
 
-async def check_bundle_status(bundle_ids: List[str]) -> dict:
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getBundleStatuses",
-        "params": [bundle_ids],
-    }
-    async with aiohttp.ClientSession() as session:
-        async with session.post(JITO_BUNDLE_URL, json=payload, headers=JITO_AUTH_HEADER) as resp:
-            return await resp.json()
-
 async def get_token_balance(rpc: AsyncClient, wallet: Pubkey, mint: Pubkey) -> int:
     """Return raw token balance from associated token account."""
     from spl.token.instructions import get_associated_token_address
@@ -170,7 +192,6 @@ async def get_token_balance(rpc: AsyncClient, wallet: Pubkey, mint: Pubkey) -> i
         if acc.value is None:
             return 0
         data = acc.value.data
-        # Token account layout: amount is u64 at offset 64
         if len(data) < 72:
             return 0
         amount_bytes = data[64:72]
@@ -191,13 +212,11 @@ async def safety_check(mint: str, rpc: AsyncClient) -> bool:
             async with session.get(url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    # If any risk is above threshold, fail
                     risks = data.get("risks", [])
                     if any(r.get("level", 0) > MAX_RUGCHECK_RISK for r in risks):
-                        logger.info(f"RugCheck risks found for {mint[:8]}...: {risks}")
+                        logger.info(f"RugCheck risks found for {mint[:8]}...")
                         return False
                 else:
-                    # No report yet – often too new, treat as risky
                     logger.info(f"No RugCheck report for {mint[:8]}...")
                     return False
     except Exception as e:
@@ -211,12 +230,12 @@ async def safety_check(mint: str, rpc: AsyncClient) -> bool:
         if acc.value is None:
             return False
         data = acc.value.data
-        # Mint authority at offset 0: 4 bytes option, 32 bytes if Some
+        # Mint authority at offset 0
         mint_auth_option = int.from_bytes(data[0:4], "little")
-        if mint_auth_option != 0:  # Not None
+        if mint_auth_option != 0:
             logger.info(f"Mint authority not renounced for {mint[:8]}...")
             return False
-        # Freeze authority at offset 36: 4 bytes option
+        # Freeze authority at offset 36
         if len(data) > 39:
             freeze_auth_option = int.from_bytes(data[36:40], "little")
             if freeze_auth_option != 0:
@@ -237,33 +256,26 @@ async def buy_with_jito(
     wallet: Keypair,
     sol_amount: float,
     slippage_bps: int,
-    jupiter: Jupiter,
     tip_lamports: int,
 ) -> Tuple[str, VersionedTransaction]:
-    """Snipe a token with Jito bundle. Returns (bundle_id, swap_tx)."""
-    # 1. Quote & swap
-    quote = await jupiter.quote(
-        input_mint="So11111111111111111111111111111111111111112",
-        output_mint=mint,
-        amount=int(sol_amount * 1e9),
-        slippage_bps=slippage_bps,
-    )
-    tx_data = await jupiter.swap(
-        quote_response=quote,
-        user_public_key=str(wallet.pubkey()),
-        wrap_and_unwrap_sol=True,
-        as_legacy_transaction=False,
-    )
+    """Snipe a token with Jito bundle."""
+    amount_lamports = int(sol_amount * 1e9)
+    
+    # 1. Quote
+    quote = await jupiter_quote(WSOL_MINT, mint, amount_lamports, slippage_bps)
+    
+    # 2. Swap transaction
+    tx_data = await jupiter_swap(quote, str(wallet.pubkey()))
     swap_tx = VersionedTransaction.from_bytes(base64.b64decode(tx_data["swapTransaction"]))
 
-    # 2. Extract blockhash from swap tx (fresh enough)
+    # 3. Extract blockhash
     blockhash_str = str(swap_tx.message.recent_blockhash)
 
-    # 3. Build tip tx with same blockhash
-    tip_account = TIP_ACCOUNTS[0]  # rotate later if needed
+    # 4. Tip transaction
+    tip_account = TIP_ACCOUNTS[0]
     tip_tx = create_tip_transaction(wallet, tip_account, tip_lamports, blockhash_str)
 
-    # 4. Send bundle
+    # 5. Send bundle
     bundle_id = await send_jito_bundle(swap_tx, tip_tx)
     logger.info(f"Buy bundle sent: {bundle_id}")
     return bundle_id, swap_tx
@@ -277,39 +289,30 @@ async def sell_with_jito(
     wallet: Keypair,
     token_amount: int,
     slippage_bps: int,
-    jupiter: Jupiter,
     tip_lamports: int,
 ) -> Tuple[str, VersionedTransaction]:
-    """Sell tokens via Jito bundle. Returns (bundle_id, sell_tx)."""
+    """Sell tokens via Jito bundle."""
     # 1. Quote sell
-    quote = await jupiter.quote(
-        input_mint=mint,
-        output_mint="So11111111111111111111111111111111111111112",
-        amount=token_amount,
-        slippage_bps=slippage_bps,
-    )
-    tx_data = await jupiter.swap(
-        quote_response=quote,
-        user_public_key=str(wallet.pubkey()),
-        wrap_and_unwrap_sol=True,
-        as_legacy_transaction=False,
-    )
+    quote = await jupiter_quote(mint, WSOL_MINT, token_amount, slippage_bps)
+    
+    # 2. Swap transaction
+    tx_data = await jupiter_swap(quote, str(wallet.pubkey()))
     sell_tx = VersionedTransaction.from_bytes(base64.b64decode(tx_data["swapTransaction"]))
 
-    # 2. Extract blockhash
+    # 3. Extract blockhash
     blockhash_str = str(sell_tx.message.recent_blockhash)
 
-    # 3. Tip
+    # 4. Tip
     tip_account = TIP_ACCOUNTS[0]
     tip_tx = create_tip_transaction(wallet, tip_account, tip_lamports, blockhash_str)
 
-    # 4. Bundle
+    # 5. Bundle
     bundle_id = await send_jito_bundle(sell_tx, tip_tx)
     logger.info(f"Sell bundle sent: {bundle_id}")
     return bundle_id, sell_tx
 
 # ----------------------------------------------------------------------
-# Smart Exit Monitor (scaling, trailing stop, MC, time)
+# Smart Exit Monitor
 # ----------------------------------------------------------------------
 
 async def get_market_cap(mint: str) -> float:
@@ -327,30 +330,12 @@ async def get_market_cap(mint: str) -> float:
         pass
     return 0.0
 
-async def get_liquidity(mint: str) -> float:
-    """Total liquidity in USD from DexScreener."""
-    try:
-        async with aiohttp.ClientSession() as s:
-            url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
-            async with s.get(url) as resp:
-                data = await resp.json()
-                total_liq = 0.0
-                if data.get("pairs"):
-                    for pair in data["pairs"]:
-                        liq = pair.get("liquidity", {}).get("usd", 0)
-                        total_liq += float(liq)
-                return total_liq
-    except Exception:
-        pass
-    return 0.0
-
 async def ultimate_exit_monitor(
     mint: str,
     wallet: Keypair,
     initial_token_amount: int,
     buy_price_sol: float,
     rpc: AsyncClient,
-    jupiter: Jupiter,
     slippage_bps: int,
     tip_lamports: int,
     target_multiples: List[Tuple[float, float]],
@@ -364,31 +349,27 @@ async def ultimate_exit_monitor(
     remaining = initial_token_amount
     peak_sol = buy_price_sol
 
-    logger.info(f"Exit monitor started for {mint[:8]}...")
+    logger.info(f"Exit monitor started for {mint[:8]}... (amount: {remaining})")
 
     # Scaling out levels
     for mult, fraction in target_multiples:
         while remaining > 0:
-            # --- Time / MC failsafe ---
+            # Time failsafe
             if time.time() - start_time > max_hold_seconds:
                 logger.info(f"Time limit reached, selling remaining {remaining}")
-                await sell_with_jito(mint, wallet, remaining, slippage_bps, jupiter, tip_lamports)
+                await sell_with_jito(mint, wallet, remaining, slippage_bps, tip_lamports)
                 return
 
+            # MC failsafe
             mc = await get_market_cap(mint)
             if 0 < mc >= target_mc:
                 logger.info(f"Market cap ${mc:.0f} reached, selling remaining {remaining}")
-                await sell_with_jito(mint, wallet, remaining, slippage_bps, jupiter, tip_lamports)
+                await sell_with_jito(mint, wallet, remaining, slippage_bps, tip_lamports)
                 return
 
-            # --- Price check ---
+            # Price check
             try:
-                quote = await jupiter.quote(
-                    input_mint=mint,
-                    output_mint="So11111111111111111111111111111111111111112",
-                    amount=remaining,
-                    slippage_bps=slippage_bps,
-                )
+                quote = await jupiter_quote(mint, WSOL_MINT, remaining, slippage_bps)
                 current_sol = int(quote['outAmount']) / 1e9
             except Exception:
                 await asyncio.sleep(2)
@@ -397,45 +378,39 @@ async def ultimate_exit_monitor(
             if current_sol > peak_sol:
                 peak_sol = current_sol
 
-            # Stop-loss: dump everything if we lose too much
+            # Stop-loss
             if current_sol <= buy_price_sol * stop_loss_factor:
                 logger.info(f"Stop-loss hit ({current_sol:.4f} SOL), selling all")
-                await sell_with_jito(mint, wallet, remaining, slippage_bps, jupiter, tip_lamports)
+                await sell_with_jito(mint, wallet, remaining, slippage_bps, tip_lamports)
                 return
 
-            # If current value hits this multiple, sell the planned fraction
+            # Take profit at this multiple
             if current_sol >= buy_price_sol * mult:
                 sell_amount = int(initial_token_amount * fraction)
                 sell_amount = min(sell_amount, remaining)
                 logger.info(f"Selling {fraction*100:.0f}% at {mult}x (value: {current_sol:.4f})")
-                await sell_with_jito(mint, wallet, sell_amount, slippage_bps, jupiter, tip_lamports)
+                await sell_with_jito(mint, wallet, sell_amount, slippage_bps, tip_lamports)
                 remaining -= sell_amount
-                # Reset peak for trailing stop on the remainder
                 peak_sol = current_sol
                 break
 
             await asyncio.sleep(2)
 
-    # --- Moonbag trailing stop ---
+    # Moonbag trailing stop
     while remaining > 0:
         if time.time() - start_time > max_hold_seconds:
-            logger.info("Final time limit for moonbag, selling remaining")
-            await sell_with_jito(mint, wallet, remaining, slippage_bps, jupiter, tip_lamports)
+            logger.info("Final time limit for moonbag, selling")
+            await sell_with_jito(mint, wallet, remaining, slippage_bps, tip_lamports)
             return
 
         mc = await get_market_cap(mint)
         if 0 < mc >= target_mc:
             logger.info(f"Market cap target reached for moonbag, selling")
-            await sell_with_jito(mint, wallet, remaining, slippage_bps, jupiter, tip_lamports)
+            await sell_with_jito(mint, wallet, remaining, slippage_bps, tip_lamports)
             return
 
         try:
-            quote = await jupiter.quote(
-                input_mint=mint,
-                output_mint="So11111111111111111111111111111111111111112",
-                amount=remaining,
-                slippage_bps=slippage_bps,
-            )
+            quote = await jupiter_quote(mint, WSOL_MINT, remaining, slippage_bps)
             current_sol = int(quote['outAmount']) / 1e9
         except Exception:
             await asyncio.sleep(2)
@@ -445,8 +420,8 @@ async def ultimate_exit_monitor(
             peak_sol = current_sol
 
         if current_sol <= peak_sol * (1 - trailing_stop_pct / 100):
-            logger.info(f"Trailing stop on moonbag: peak {peak_sol:.4f}, current {current_sol:.4f}")
-            await sell_with_jito(mint, wallet, remaining, slippage_bps, jupiter, tip_lamports)
+            logger.info(f"Trailing stop: peak {peak_sol:.4f}, current {current_sol:.4f}")
+            await sell_with_jito(mint, wallet, remaining, slippage_bps, tip_lamports)
             return
 
         await asyncio.sleep(2)
@@ -456,7 +431,7 @@ async def ultimate_exit_monitor(
 # ----------------------------------------------------------------------
 
 async def discover_new_tokens():
-    """Poll DexScreener for new Solana tokens. Yields mint addresses."""
+    """Poll DexScreener for new Solana tokens."""
     async with aiohttp.ClientSession() as session:
         while True:
             try:
@@ -482,12 +457,13 @@ async def discover_new_tokens():
 
 async def main():
     logger.info("Starting Solana Meme Sniper Bot")
+    logger.info(f"Wallet: {WALLET.pubkey()}")
+    logger.info(f"Snipe amount: {SNIPE_AMOUNT_SOL} SOL")
 
     rpc = await create_rpc()
-    jupiter = create_jupiter()
 
     async for mint in discover_new_tokens():
-        logger.info(f"New token discovered: {mint[:8]}...")
+        logger.info(f"New token discovered: {mint}")
 
         # Safety checks
         if not await safety_check(mint, rpc):
@@ -503,17 +479,17 @@ async def main():
                 wallet=WALLET,
                 sol_amount=SNIPE_AMOUNT_SOL,
                 slippage_bps=SLIPPAGE_BPS,
-                jupiter=jupiter,
                 tip_lamports=TIP_LAMPORTS,
             )
+            logger.info(f"Buy transaction sent! Bundle ID: {bundle_id}")
         except Exception as e:
             logger.error(f"Buy failed: {e}")
             continue
 
-        # Wait a few seconds for token account to be created
+        # Wait for token account creation
         await asyncio.sleep(5)
 
-        # Get actual received token balance
+        # Get received balance
         token_amount = await get_token_balance(rpc, WALLET.pubkey(), Pubkey.from_string(mint))
         if token_amount == 0:
             logger.warning("No tokens received, skipping exit monitor.")
@@ -529,7 +505,6 @@ async def main():
                 initial_token_amount=token_amount,
                 buy_price_sol=SNIPE_AMOUNT_SOL,
                 rpc=rpc,
-                jupiter=jupiter,
                 slippage_bps=SLIPPAGE_BPS,
                 tip_lamports=TIP_LAMPORTS,
                 target_multiples=TARGET_MULTIPLES,
