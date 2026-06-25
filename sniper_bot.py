@@ -47,43 +47,14 @@ RPC_HTTP = os.getenv("RPC_HTTP", "")
 if not RPC_HTTP:
     raise ValueError("RPC_HTTP not set in .env")
 
+# Wallet - accepts Base58 private key string
+private_key_str = os.getenv("PRIVATE_KEY", "")
+if not private_key_str:
+    raise ValueError("PRIVATE_KEY not set in .env")
+
 try:
-    # Decode Base58 private key
-    import base64 as b64
-    
-    # Try solders first (newer versions)
-    try:
-        from solders.keypair import Keypair as SoldersKeypair
-        WALLET = SoldersKeypair.from_base58_string(PRIVATE_KEY_STR)
-        logger.info(f"Wallet loaded: {WALLET.pubkey()}")
-    except AttributeError:
-        # Fallback: manual base58 decode
-        # Base58 alphabet
-        ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-        ALPHABET_MAP = {char: idx for idx, char in enumerate(ALPHABET)}
-        
-        def b58decode(s: str) -> bytes:
-            """Decode base58 string to bytes."""
-            # Count leading zeros (1s in base58)
-            leading_zeros = len(s) - len(s.lstrip('1'))
-            
-            # Convert base58 to integer
-            num = 0
-            for char in s:
-                num = num * 58 + ALPHABET_MAP[char]
-            
-            # Convert to bytes (25 or 38 bytes for Solana keys)
-            # Solana private keys are 64 bytes, encoded is ~88 chars
-            combined = num.to_bytes((num.bit_length() + 7) // 8, 'big')
-            
-            # Add back leading zeros
-            return b'\x00' * leading_zeros + combined
-        
-        private_key_bytes = b58decode(PRIVATE_KEY_STR)
-        if len(private_key_bytes) != 64:
-            raise ValueError(f"Invalid key length: {len(private_key_bytes)} bytes (expected 64)")
-        WALLET = Keypair.from_bytes(private_key_bytes)
-        logger.info(f"Wallet loaded: {WALLET.pubkey()}")
+    WALLET = Keypair.from_base58_string(private_key_str)
+    logger.info(f"Wallet loaded: {WALLET.pubkey()}")
 except Exception as e:
     raise ValueError(f"Invalid PRIVATE_KEY: {e}")
 
@@ -141,7 +112,8 @@ async def jupiter_quote(input_mint: str, output_mint: str, amount: int, slippage
     async with aiohttp.ClientSession() as session:
         async with session.get(JUPITER_QUOTE_URL, params=params) as resp:
             if resp.status != 200:
-                raise Exception(f"Jupiter quote error: {await resp.text()}")
+                error_text = await resp.text()
+                raise Exception(f"Jupiter quote error: {error_text}")
             return await resp.json()
 
 async def jupiter_swap(quote_response: dict, user_public_key: str) -> dict:
@@ -156,7 +128,8 @@ async def jupiter_swap(quote_response: dict, user_public_key: str) -> dict:
     async with aiohttp.ClientSession() as session:
         async with session.post(JUPITER_SWAP_URL, json=payload) as resp:
             if resp.status != 200:
-                raise Exception(f"Jupiter swap error: {await resp.text()}")
+                error_text = await resp.text()
+                raise Exception(f"Jupiter swap error: {error_text}")
             return await resp.json()
 
 # ----------------------------------------------------------------------
@@ -209,9 +182,9 @@ async def send_jito_bundle(
 
 async def get_token_balance(rpc: AsyncClient, wallet: Pubkey, mint: Pubkey) -> int:
     """Return raw token balance from associated token account."""
-    from spl.token.instructions import get_associated_token_address
-    ata = get_associated_token_address(wallet, mint)
     try:
+        from spl.token.instructions import get_associated_token_address
+        ata = get_associated_token_address(wallet, mint)
         acc = await rpc.get_account_info(ata, commitment=Confirmed)
         if acc.value is None:
             return 0
@@ -255,6 +228,8 @@ async def safety_check(mint: str, rpc: AsyncClient) -> bool:
             return False
         data = acc.value.data
         # Mint authority at offset 0
+        if len(data) < 4:
+            return False
         mint_auth_option = int.from_bytes(data[0:4], "little")
         if mint_auth_option != 0:
             logger.info(f"Mint authority not renounced for {mint[:8]}...")
@@ -359,7 +334,6 @@ async def ultimate_exit_monitor(
     wallet: Keypair,
     initial_token_amount: int,
     buy_price_sol: float,
-    rpc: AsyncClient,
     slippage_bps: int,
     tip_lamports: int,
     target_multiples: List[Tuple[float, float]],
@@ -480,9 +454,12 @@ async def discover_new_tokens():
 # ----------------------------------------------------------------------
 
 async def main():
+    logger.info("=" * 60)
     logger.info("Starting Solana Meme Sniper Bot")
     logger.info(f"Wallet: {WALLET.pubkey()}")
     logger.info(f"Snipe amount: {SNIPE_AMOUNT_SOL} SOL")
+    logger.info(f"Jito tip: {TIP_LAMPORTS} lamports")
+    logger.info("=" * 60)
 
     rpc = await create_rpc()
 
@@ -528,7 +505,6 @@ async def main():
                 wallet=WALLET,
                 initial_token_amount=token_amount,
                 buy_price_sol=SNIPE_AMOUNT_SOL,
-                rpc=rpc,
                 slippage_bps=SLIPPAGE_BPS,
                 tip_lamports=TIP_LAMPORTS,
                 target_multiples=TARGET_MULTIPLES,
