@@ -25,7 +25,6 @@ from solders.hash import Hash
 from solders.system_program import TransferParams, transfer
 from solders.transaction import VersionedTransaction
 from solders.message import MessageV0
-from solders.signature import Signature
 
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.commitment import Confirmed
@@ -34,7 +33,7 @@ from solana.rpc.commitment import Confirmed
 # Logging
 # ----------------------------------------------------------------------
 logging.basicConfig(
-    level=logging.DEBUG,  # Set to DEBUG for verbose output
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
@@ -64,6 +63,9 @@ except Exception as e:
 # Jito
 JITO_BUNDLE_URL = os.getenv("JITO_BUNDLE_URL", "https://mainnet.block-engine.jito.wtf/api/v1/bundles")
 JITO_AUTH_HEADER = {"x-jito-auth": os.getenv("JITO_AUTH_HEADER", "")} if os.getenv("JITO_AUTH_HEADER") else {}
+
+# SEND MODE: "jito" or "rpc"
+SEND_MODE = os.getenv("SEND_MODE", "rpc")  # Default to RPC for testing
 
 # Official Jito tip wallets
 TIP_ACCOUNTS = [
@@ -114,7 +116,6 @@ async def rate_limited_jupiter_call():
     elapsed = time.time() - LAST_JUPITER_CALL
     if elapsed < JUPITER_RATE_LIMIT:
         wait = JUPITER_RATE_LIMIT - elapsed + random.uniform(0, 0.5)
-        logger.debug(f"Rate limiting Jupiter: waiting {wait:.2f}s")
         await asyncio.sleep(wait)
     LAST_JUPITER_CALL = time.time()
 
@@ -133,17 +134,13 @@ async def jupiter_quote(input_mint: str, output_mint: str, amount: int, slippage
         "slippageBps": str(slippage_bps),
     }
     
-    logger.debug(f"Jupiter quote: {input_mint[:8]}... -> {output_mint[:8]}... amount={amount}")
-    
     max_retries = 3
     for attempt in range(max_retries):
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
                 async with session.get(JUPITER_QUOTE_URL, params=params) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
-                        logger.debug(f"Quote received: outAmount={data.get('outAmount', 'N/A')}")
-                        return data
+                        return await resp.json()
                     elif resp.status == 429:
                         wait_time = (attempt + 1) * 2
                         logger.warning(f"Rate limited by Jupiter, waiting {wait_time}s...")
@@ -151,11 +148,9 @@ async def jupiter_quote(input_mint: str, output_mint: str, amount: int, slippage
                         continue
                     else:
                         error_text = await resp.text()
-                        logger.error(f"Jupiter quote error (status {resp.status}): {error_text[:200]}")
-                        raise Exception(f"Jupiter quote error: {error_text[:200]}")
+                        raise Exception(f"Jupiter quote error: {error_text}")
         except asyncio.TimeoutError:
             if attempt < max_retries - 1:
-                logger.warning(f"Jupiter quote timeout, retry {attempt+1}/{max_retries}")
                 await asyncio.sleep(1)
                 continue
             raise
@@ -173,18 +168,13 @@ async def jupiter_swap(quote_response: dict, user_public_key: str) -> dict:
         "prioritizationFeeLamports": "auto",
     }
     
-    logger.debug(f"Jupiter swap request for {user_public_key[:8]}...")
-    
     max_retries = 3
     for attempt in range(max_retries):
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
                 async with session.post(JUPITER_SWAP_URL, json=payload) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
-                        tx_len = len(data.get("swapTransaction", ""))
-                        logger.debug(f"Swap tx received: base64 length={tx_len}")
-                        return data
+                        return await resp.json()
                     elif resp.status == 429:
                         wait_time = (attempt + 1) * 2
                         logger.warning(f"Rate limited on swap, waiting {wait_time}s...")
@@ -192,70 +182,13 @@ async def jupiter_swap(quote_response: dict, user_public_key: str) -> dict:
                         continue
                     else:
                         error_text = await resp.text()
-                        logger.error(f"Jupiter swap error (status {resp.status}): {error_text[:200]}")
-                        raise Exception(f"Jupiter swap error: {error_text[:200]}")
+                        raise Exception(f"Jupiter swap error: {error_text}")
         except asyncio.TimeoutError:
             if attempt < max_retries - 1:
-                logger.warning(f"Jupiter swap timeout, retry {attempt+1}/{max_retries}")
                 await asyncio.sleep(1)
                 continue
             raise
     raise Exception("Jupiter swap failed after retries")
-
-# ----------------------------------------------------------------------
-# Helper: Sign a VersionedTransaction (solders 0.27.1)
-# ----------------------------------------------------------------------
-
-def sign_versioned_tx(tx: VersionedTransaction, wallet: Keypair) -> VersionedTransaction:
-    """
-    Sign a VersionedTransaction for solders 0.27.1.
-    
-    In solders 0.27.1, the message is signed by the wallet and 
-    we rebuild the transaction with key_signatures.
-    """
-    logger.debug(f"Signing transaction - type: {type(tx).__name__}")
-    logger.debug(f"Message type: {type(tx.message).__name__}")
-    logger.debug(f"Transaction bytes length: {len(bytes(tx))}")
-    
-    try:
-        # Method 1: Try key_signatures constructor
-        msg_bytes = bytes(tx.message)
-        sig = wallet.sign_message(msg_bytes)
-        logger.debug(f"Signature created: {sig}")
-        
-        # Build with key_signatures (solders 0.27 format)
-        signed_tx = VersionedTransaction(
-            message=tx.message,
-            key_signatures=[(wallet.pubkey(), sig)]
-        )
-        logger.debug("Transaction signed successfully (method 1)")
-        return signed_tx
-        
-    except Exception as e:
-        logger.warning(f"Sign method 1 failed: {e}")
-        
-        try:
-            # Method 2: Try direct signature manipulation
-            msg_bytes = bytes(tx.message)
-            sig = wallet.sign_message(msg_bytes)
-            
-            # Get current signatures and replace/add
-            sigs = list(tx.signatures)
-            logger.debug(f"Current signatures count: {len(sigs)}")
-            
-            if len(sigs) > 0:
-                sigs[0] = sig
-            else:
-                sigs.append(sig)
-                
-            signed_tx = VersionedTransaction(tx.message, sigs)
-            logger.debug("Transaction signed successfully (method 2)")
-            return signed_tx
-            
-        except Exception as e2:
-            logger.warning(f"Sign method 2 failed: {e2}")
-            logger.warning("Returning transaction unsigned - Jito may reject it")
-            return tx
 
 # ----------------------------------------------------------------------
 # Helpers
@@ -268,7 +201,6 @@ def create_tip_transaction(
     wallet: Keypair, tip_account: str, lamports: int, recent_blockhash: str
 ) -> VersionedTransaction:
     """Create a simple SOL transfer to a Jito tip address."""
-    logger.debug(f"Creating tip tx: {lamports} lamports to {tip_account[:8]}...")
     to_pubkey = Pubkey.from_string(tip_account)
     ix = transfer(
         TransferParams(
@@ -285,55 +217,77 @@ def create_tip_transaction(
     )
     return VersionedTransaction(msg, [wallet])
 
-async def send_jito_bundle(
-    swap_tx: VersionedTransaction, tip_tx: VersionedTransaction
-) -> str:
-    """Send swap + tip as a Jito bundle, with retry on rate limits."""
-    swap_b64 = base64.b64encode(bytes(swap_tx)).decode("utf-8")
-    tip_b64 = base64.b64encode(bytes(tip_tx)).decode("utf-8")
+def sign_swap_transaction(tx: VersionedTransaction, wallet: Keypair) -> VersionedTransaction:
+    """
+    Sign Jupiter swap transaction with our wallet for solders 0.27.1.
+    Jupiter's tx already has the fee payer signature; we add our wallet.
+    """
+    try:
+        # Rebuild transaction with our wallet as signer
+        return VersionedTransaction(tx.message, [wallet])
+    except Exception as e:
+        logger.warning(f"Sign failed: {e}, returning original")
+        return tx
+
+async def send_transaction(swap_tx: VersionedTransaction, tip_tx: Optional[VersionedTransaction] = None) -> str:
+    """Send transaction via Jito bundle or direct RPC based on SEND_MODE."""
     
-    logger.debug(f"Sending Jito bundle - swap: {len(swap_b64)} chars, tip: {len(tip_b64)} chars")
+    if SEND_MODE == "rpc":
+        # Direct RPC send (no Jito, no tip)
+        rpc = await create_rpc()
+        try:
+            txid = await rpc.send_transaction(
+                swap_tx,
+                opts={"skip_preflight": True, "max_retries": 2}
+            )
+            result = str(txid)
+            logger.info(f"Transaction sent via RPC: {result}")
+            return result
+        except Exception as e:
+            raise Exception(f"RPC send failed: {e}")
     
-    bundle = [swap_b64, tip_b64]
-    payload = {
-        "jsonrpc": "2.0",
-        "id": str(uuid.uuid4()),
-        "method": "sendBundle",
-        "params": [bundle],
-    }
-    
-    max_retries = 3
-    for attempt in range(max_retries):
-        async with aiohttp.ClientSession() as session:
-            async with session.post(JITO_BUNDLE_URL, json=payload, headers=JITO_AUTH_HEADER) as resp:
-                result = await resp.json()
-                logger.debug(f"Jito response: {json.dumps(result, default=str)[:300]}")
+    else:
+        # Jito bundle
+        if tip_tx is None:
+            raise Exception("Tip transaction required for Jito")
+            
+        swap_b64 = base64.b64encode(bytes(swap_tx)).decode("utf-8")
+        tip_b64 = base64.b64encode(bytes(tip_tx)).decode("utf-8")
+        bundle = [swap_b64, tip_b64]
+        
+        payload = {
+            "jsonrpc": "2.0",
+            "id": str(uuid.uuid4()),
+            "method": "sendBundle",
+            "params": [bundle],
+        }
+        
+        max_retries = 3
+        for attempt in range(max_retries):
+            async with aiohttp.ClientSession() as session:
+                async with session.post(JITO_BUNDLE_URL, json=payload, headers=JITO_AUTH_HEADER) as resp:
+                    result = await resp.json()
+                    
+            if "error" in result:
+                error_code = result["error"].get("code", 0)
+                error_msg = result["error"].get("message", "")
                 
-        if "error" in result:
-            error_code = result["error"].get("code", 0)
-            error_msg = result["error"].get("message", "")
-            
-            logger.warning(f"Jito error (code={error_code}): {error_msg}")
-            
-            if error_code == -32097 or "rate limited" in error_msg.lower():
-                wait_time = (attempt + 1) * 3
-                logger.warning(f"Jito rate limited, waiting {wait_time}s...")
-                await asyncio.sleep(wait_time)
-                continue
-            elif "could not be decoded" in error_msg.lower():
-                logger.error("Transaction decode error - attempting re-sign...")
-                swap_tx = sign_versioned_tx(swap_tx, WALLET)
-                bundle[0] = base64.b64encode(bytes(swap_tx)).decode("utf-8")
-                payload["params"] = [bundle]
-                await asyncio.sleep(1)
-                continue
+                if error_code == -32097 or "rate limited" in error_msg.lower():
+                    wait_time = (attempt + 1) * 3
+                    logger.warning(f"Jito rate limited, waiting {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                    continue
+                elif "could not be decoded" in error_msg.lower():
+                    logger.error("Jito cannot decode transaction. Try SEND_MODE=rpc")
+                    raise Exception(f"Jito decode error: {error_msg}")
+                else:
+                    raise Exception(f"Jito error: {result['error']}")
             else:
-                raise Exception(f"Jito error: {result['error']}")
-        else:
-            logger.info(f"Bundle accepted: {result.get('result', 'N/A')}")
-            return result["result"]
-    
-    raise Exception("Jito bundle failed after retries")
+                bundle_id = result.get("result", "unknown")
+                logger.info(f"Jito bundle accepted: {bundle_id}")
+                return bundle_id
+        
+        raise Exception("Jito bundle failed after retries")
 
 async def get_token_balance(rpc: AsyncClient, wallet: Pubkey, mint: Pubkey) -> int:
     """Return raw token balance from associated token account."""
@@ -347,11 +301,8 @@ async def get_token_balance(rpc: AsyncClient, wallet: Pubkey, mint: Pubkey) -> i
         if len(data) < 72:
             return 0
         amount_bytes = data[64:72]
-        balance = int.from_bytes(amount_bytes, "little")
-        logger.debug(f"Token balance for {str(mint)[:8]}...: {balance}")
-        return balance
-    except Exception as e:
-        logger.debug(f"Error getting token balance: {e}")
+        return int.from_bytes(amount_bytes, "little")
+    except Exception:
         return 0
 
 # ----------------------------------------------------------------------
@@ -360,8 +311,6 @@ async def get_token_balance(rpc: AsyncClient, wallet: Pubkey, mint: Pubkey) -> i
 
 async def safety_check(mint: str, rpc: AsyncClient) -> bool:
     """Return True if token passes all checks."""
-    logger.debug(f"Safety check for {mint[:12]}...")
-    
     # 1. RugCheck API
     try:
         async with aiohttp.ClientSession() as session:
@@ -382,7 +331,7 @@ async def safety_check(mint: str, rpc: AsyncClient) -> bool:
                             logger.info(f"RugCheck risk: {risk_name} (level {level})")
                             return False
                 elif resp.status == 404:
-                    logger.debug(f"No RugCheck report yet for {mint[:8]}... (allowing)")
+                    logger.info(f"No RugCheck report yet for {mint[:8]}... (allowing)")
                 else:
                     logger.warning(f"RugCheck API error: {resp.status}")
     except asyncio.TimeoutError:
@@ -400,7 +349,6 @@ async def safety_check(mint: str, rpc: AsyncClient) -> bool:
 
         data = acc.value.data
 
-        # Check mint authority
         if len(data) < 4:
             return False
         mint_auth_option = int.from_bytes(data[0:4], "little")
@@ -408,21 +356,19 @@ async def safety_check(mint: str, rpc: AsyncClient) -> bool:
             logger.info(f"Mint authority not renounced for {mint[:8]}...")
             return False
 
-        # Check freeze authority (allow it temporarily)
         if len(data) > 39:
             freeze_auth_option = int.from_bytes(data[36:40], "little")
             if freeze_auth_option != 0:
-                logger.debug(f"Freeze authority present on {mint[:8]}... (proceeding anyway)")
+                logger.info(f"Freeze authority present on {mint[:8]}... (proceeding anyway)")
 
     except Exception as e:
         logger.warning(f"On-chain check error: {e}")
         return False
 
-    logger.debug(f"Safety check PASSED for {mint[:8]}...")
     return True
 
 # ----------------------------------------------------------------------
-# Jito Bundled Buy
+# Buy
 # ----------------------------------------------------------------------
 
 async def buy_with_jito(
@@ -432,10 +378,8 @@ async def buy_with_jito(
     slippage_bps: int,
     tip_lamports: int,
 ) -> Tuple[str, VersionedTransaction]:
-    """Snipe a token with Jito bundle."""
+    """Snipe a token."""
     amount_lamports = int(sol_amount * 1e9)
-    
-    logger.debug(f"Buy: {sol_amount} SOL of {mint[:8]}...")
     
     # 1. Quote
     quote = await jupiter_quote(WSOL_MINT, mint, amount_lamports, slippage_bps)
@@ -445,26 +389,23 @@ async def buy_with_jito(
     swap_tx_bytes = base64.b64decode(tx_data["swapTransaction"])
     swap_tx = VersionedTransaction.from_bytes(swap_tx_bytes)
     
-    logger.debug(f"Swap tx deserialized: {len(swap_tx_bytes)} bytes")
+    # 3. Sign with our wallet
+    swap_tx = sign_swap_transaction(swap_tx, wallet)
     
-    # 3. SIGN the transaction
-    swap_tx = sign_versioned_tx(swap_tx, wallet)
-    
-    # 4. Extract blockhash
+    # 4. Blockhash
     blockhash_str = str(swap_tx.message.recent_blockhash)
-    logger.debug(f"Blockhash: {blockhash_str[:16]}...")
 
-    # 5. Tip transaction
-    tip_account = TIP_ACCOUNTS[0]
-    tip_tx = create_tip_transaction(wallet, tip_account, tip_lamports, blockhash_str)
-
-    # 6. Send bundle
-    bundle_id = await send_jito_bundle(swap_tx, tip_tx)
-    logger.info(f"✅ Buy bundle sent: {bundle_id}")
-    return bundle_id, swap_tx
+    # 5. Send (Jito or RPC)
+    if SEND_MODE == "rpc":
+        txid = await send_transaction(swap_tx)
+        return txid, swap_tx
+    else:
+        tip_tx = create_tip_transaction(wallet, TIP_ACCOUNTS[0], tip_lamports, blockhash_str)
+        bundle_id = await send_transaction(swap_tx, tip_tx)
+        return bundle_id, swap_tx
 
 # ----------------------------------------------------------------------
-# Jito Bundled Sell
+# Sell
 # ----------------------------------------------------------------------
 
 async def sell_with_jito(
@@ -474,9 +415,7 @@ async def sell_with_jito(
     slippage_bps: int,
     tip_lamports: int,
 ) -> Tuple[str, VersionedTransaction]:
-    """Sell tokens via Jito bundle."""
-    logger.debug(f"Sell: {token_amount} of {mint[:8]}...")
-    
+    """Sell tokens."""
     # 1. Quote sell
     quote = await jupiter_quote(mint, WSOL_MINT, token_amount, slippage_bps)
     
@@ -485,20 +424,20 @@ async def sell_with_jito(
     sell_tx_bytes = base64.b64decode(tx_data["swapTransaction"])
     sell_tx = VersionedTransaction.from_bytes(sell_tx_bytes)
     
-    # 3. SIGN the transaction
-    sell_tx = sign_versioned_tx(sell_tx, wallet)
+    # 3. Sign with our wallet
+    sell_tx = sign_swap_transaction(sell_tx, wallet)
 
-    # 4. Extract blockhash
+    # 4. Blockhash
     blockhash_str = str(sell_tx.message.recent_blockhash)
 
-    # 5. Tip
-    tip_account = TIP_ACCOUNTS[0]
-    tip_tx = create_tip_transaction(wallet, tip_account, tip_lamports, blockhash_str)
-
-    # 6. Bundle
-    bundle_id = await send_jito_bundle(sell_tx, tip_tx)
-    logger.info(f"✅ Sell bundle sent: {bundle_id}")
-    return bundle_id, sell_tx
+    # 5. Send
+    if SEND_MODE == "rpc":
+        txid = await send_transaction(sell_tx)
+        return txid, sell_tx
+    else:
+        tip_tx = create_tip_transaction(wallet, TIP_ACCOUNTS[0], tip_lamports, blockhash_str)
+        bundle_id = await send_transaction(sell_tx, tip_tx)
+        return bundle_id, sell_tx
 
 # ----------------------------------------------------------------------
 # Smart Exit Monitor
@@ -532,24 +471,23 @@ async def ultimate_exit_monitor(
     max_hold_seconds: int,
     target_mc: float,
 ):
-    """Smart exit strategy combining scaling out, trailing stop, MC & time failsafes."""
+    """Smart exit strategy."""
     start_time = time.time()
     remaining = initial_token_amount
     peak_sol = buy_price_sol
 
-    logger.info(f"Exit monitor started for {mint[:8]}... (amount: {remaining})")
+    logger.info(f"Exit monitor started for {mint[:8]}...")
 
-    # Scaling out levels
     for mult, fraction in target_multiples:
         while remaining > 0:
             if time.time() - start_time > max_hold_seconds:
-                logger.info(f"Time limit reached, selling remaining {remaining}")
+                logger.info(f"Time limit, selling remaining {remaining}")
                 await sell_with_jito(mint, wallet, remaining, slippage_bps, tip_lamports)
                 return
 
             mc = await get_market_cap(mint)
             if 0 < mc >= target_mc:
-                logger.info(f"Market cap ${mc:.0f} reached, selling remaining {remaining}")
+                logger.info(f"MC ${mc:.0f} reached, selling")
                 await sell_with_jito(mint, wallet, remaining, slippage_bps, tip_lamports)
                 return
 
@@ -564,14 +502,14 @@ async def ultimate_exit_monitor(
                 peak_sol = current_sol
 
             if current_sol <= buy_price_sol * stop_loss_factor:
-                logger.info(f"Stop-loss hit ({current_sol:.4f} SOL), selling all")
+                logger.info(f"Stop-loss ({current_sol:.4f} SOL), selling all")
                 await sell_with_jito(mint, wallet, remaining, slippage_bps, tip_lamports)
                 return
 
             if current_sol >= buy_price_sol * mult:
                 sell_amount = int(initial_token_amount * fraction)
                 sell_amount = min(sell_amount, remaining)
-                logger.info(f"Selling {fraction*100:.0f}% at {mult}x (value: {current_sol:.4f})")
+                logger.info(f"Selling {fraction*100:.0f}% at {mult}x")
                 await sell_with_jito(mint, wallet, sell_amount, slippage_bps, tip_lamports)
                 remaining -= sell_amount
                 peak_sol = current_sol
@@ -579,16 +517,15 @@ async def ultimate_exit_monitor(
 
             await asyncio.sleep(2)
 
-    # Moonbag trailing stop
     while remaining > 0:
         if time.time() - start_time > max_hold_seconds:
-            logger.info("Final time limit for moonbag, selling")
+            logger.info("Final time limit, selling moonbag")
             await sell_with_jito(mint, wallet, remaining, slippage_bps, tip_lamports)
             return
 
         mc = await get_market_cap(mint)
         if 0 < mc >= target_mc:
-            logger.info(f"Market cap target reached for moonbag, selling")
+            logger.info("MC target reached for moonbag, selling")
             await sell_with_jito(mint, wallet, remaining, slippage_bps, tip_lamports)
             return
 
@@ -610,7 +547,7 @@ async def ultimate_exit_monitor(
         await asyncio.sleep(2)
 
 # ----------------------------------------------------------------------
-# Token Discovery (DexScreener polling)
+# Token Discovery
 # ----------------------------------------------------------------------
 
 async def discover_new_tokens():
@@ -635,7 +572,7 @@ async def discover_new_tokens():
             await asyncio.sleep(DISCOVERY_POLL_SECONDS)
 
 # ----------------------------------------------------------------------
-# Main Bot Loop
+# Main
 # ----------------------------------------------------------------------
 
 async def main():
@@ -644,29 +581,29 @@ async def main():
     logger.info(f"Wallet: {WALLET.pubkey()}")
     logger.info(f"Snipe amount: {SNIPE_AMOUNT_SOL} SOL")
     logger.info(f"Jito tip: {TIP_LAMPORTS} lamports")
-    logger.info(f"Log level: DEBUG")
+    logger.info(f"Send mode: {SEND_MODE}")
     logger.info("=" * 60)
 
     rpc = await create_rpc()
 
     async for mint in discover_new_tokens():
-        logger.info(f"New token discovered: {mint}")
+        logger.info(f"New token: {mint}")
 
         if not await safety_check(mint, rpc):
-            logger.info(f"Safety check failed for {mint[:8]}...")
+            logger.info(f"Safety failed for {mint[:8]}...")
             continue
 
         logger.info(f"Safety passed. Sniping {mint[:8]}...")
 
         try:
-            bundle_id, swap_tx = await buy_with_jito(
+            txid, swap_tx = await buy_with_jito(
                 mint=mint,
                 wallet=WALLET,
                 sol_amount=SNIPE_AMOUNT_SOL,
                 slippage_bps=SLIPPAGE_BPS,
                 tip_lamports=TIP_LAMPORTS,
             )
-            logger.info(f"Buy transaction sent! Bundle ID: {bundle_id}")
+            logger.info(f"Buy sent! TX: {txid}")
         except Exception as e:
             logger.error(f"Buy failed: {e}")
             continue
@@ -675,7 +612,7 @@ async def main():
 
         token_amount = await get_token_balance(rpc, WALLET.pubkey(), Pubkey.from_string(mint))
         if token_amount == 0:
-            logger.warning("No tokens received, skipping exit monitor.")
+            logger.warning("No tokens received, skipping exit.")
             continue
 
         logger.info(f"Received {token_amount} tokens. Starting exit monitor...")
