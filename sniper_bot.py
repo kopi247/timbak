@@ -237,16 +237,15 @@ async def send_transaction(swap_tx: VersionedTransaction, tip_tx: Optional[Versi
     if SEND_MODE == "rpc":
         rpc = await create_rpc()
         try:
-            # Simple send with skip_preflight as keyword args
-            txid = await rpc.send_raw_transaction(
-                bytes(swap_tx),
-                opts={"skip_preflight": True, "max_retries": 2}
-            )
+            # solana 0.39.x: send_raw_transaction takes bytes directly
+            raw_bytes = bytes(swap_tx)
+            txid = await rpc.send_raw_transaction(raw_bytes)
             result = str(txid)
             logger.info(f"Transaction sent via RPC: {result}")
             return result
         except Exception as e:
-            raise Exception(f"RPC send failed: {e}")    
+            raise Exception(f"RPC send failed: {e}")
+    
     else:
         # Jito bundle
         if tip_tx is None:
@@ -289,7 +288,6 @@ async def send_transaction(swap_tx: VersionedTransaction, tip_tx: Optional[Versi
                 return bundle_id
         
         raise Exception("Jito bundle failed after retries")
-
 async def get_token_balance(rpc: AsyncClient, wallet: Pubkey, mint: Pubkey) -> int:
     """Return raw token balance from associated token account."""
     try:
