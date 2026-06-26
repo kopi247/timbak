@@ -3,6 +3,7 @@
 Fully Automated Solana Meme-Sniping Bot
 Uses Jupiter API directly + Jito bundles for stealth execution.
 Smart exit: scaling out, trailing stop, market-cap & time failsafes.
+Gas reserve: maintains minimum SOL balance to cover fees.
 """
 
 import asyncio
@@ -19,8 +20,6 @@ from typing import Optional, Tuple, List
 import aiohttp
 from dotenv import load_dotenv
 
-from solana.rpc.types import TxOpts
-from solana.rpc.commitment import Processed
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.hash import Hash
@@ -67,7 +66,7 @@ JITO_BUNDLE_URL = os.getenv("JITO_BUNDLE_URL", "https://mainnet.block-engine.jit
 JITO_AUTH_HEADER = {"x-jito-auth": os.getenv("JITO_AUTH_HEADER", "")} if os.getenv("JITO_AUTH_HEADER") else {}
 
 # SEND MODE: "jito" or "rpc"
-SEND_MODE = os.getenv("SEND_MODE", "rpc")  # Default to RPC for testing
+SEND_MODE = os.getenv("SEND_MODE", "rpc")
 
 # Official Jito tip wallets
 TIP_ACCOUNTS = [
@@ -82,13 +81,17 @@ JUPITER_SWAP_URL = "https://api.jup.ag/swap/v1/swap"
 
 # Rate limiting for Jupiter API
 LAST_JUPITER_CALL = 0
-JUPITER_RATE_LIMIT = 1.5  # seconds between calls
+JUPITER_RATE_LIMIT = 1.5
 
 # Snipe settings
 SNIPE_AMOUNT_SOL = float(os.getenv("SNIPE_AMOUNT_SOL", "0.05"))
 SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "2500"))
 TIP_LAMPORTS = int(os.getenv("TIP_LAMPORTS", "500000"))
 MAX_RUGCHECK_RISK = int(os.getenv("MAX_RUGCHECK_RISK", "0"))
+
+# Gas reserve settings
+GAS_RESERVE_SOL = float(os.getenv("GAS_RESERVE_SOL", "0.01"))  # Keep 0.01 SOL for gas
+GAS_PER_TX_ESTIMATE = 0.00005  # Estimated gas per transaction in SOL
 
 # Exit settings
 TARGET_MULTIPLES = [(2.0, 0.25), (3.0, 0.25), (5.0, 0.25)]
@@ -107,6 +110,38 @@ IGNORE_MINTS = {
 
 # WSOL mint
 WSOL_MINT = "So11111111111111111111111111111111111111112"
+
+# ----------------------------------------------------------------------
+# Wallet Balance Management
+# ----------------------------------------------------------------------
+
+async def get_wallet_balance(rpc: AsyncClient) -> float:
+    """Get wallet SOL balance."""
+    try:
+        resp = await rpc.get_balance(WALLET.pubkey(), commitment=Confirmed)
+        balance_sol = resp.value / 1e9
+        return balance_sol
+    except Exception as e:
+        logger.error(f"Failed to get wallet balance: {e}")
+        return 0.0
+
+def can_afford_buy(wallet_balance_sol: float) -> bool:
+    """Check if wallet can afford a buy + gas + Jito tip."""
+    # Total cost = snipe amount + tip + estimated gas
+    tip_sol = TIP_LAMPORTS / 1e9 if SEND_MODE == "jito" else 0
+    total_needed = SNIPE_AMOUNT_SOL + tip_sol + GAS_PER_TX_ESTIMATE
+    
+    # Must keep GAS_RESERVE_SOL after the buy
+    can_afford = wallet_balance_sol >= (total_needed + GAS_RESERVE_SOL)
+    
+    if not can_afford:
+        logger.warning(
+            f"Insufficient balance: {wallet_balance_sol:.4f} SOL, "
+            f"need {total_needed:.4f} + {GAS_RESERVE_SOL:.4f} reserve = "
+            f"{total_needed + GAS_RESERVE_SOL:.4f} SOL"
+        )
+    
+    return can_afford
 
 # ----------------------------------------------------------------------
 # Rate Limiter
@@ -220,34 +255,28 @@ def create_tip_transaction(
     return VersionedTransaction(msg, [wallet])
 
 def sign_swap_transaction(tx: VersionedTransaction, wallet: Keypair) -> VersionedTransaction:
-    """
-    Sign Jupiter swap transaction with our wallet for solders 0.27.1.
-    Jupiter's tx already has the fee payer signature; we add our wallet.
-    """
+    """Sign Jupiter swap transaction with our wallet for solders 0.27.1."""
     try:
-        # Rebuild transaction with our wallet as signer
         return VersionedTransaction(tx.message, [wallet])
     except Exception as e:
         logger.warning(f"Sign failed: {e}, returning original")
         return tx
 
 async def send_transaction(swap_tx: VersionedTransaction, tip_tx: Optional[VersionedTransaction] = None) -> str:
-    """Send transaction via Jito bundle or direct RPC based on SEND_MODE."""
+    """Send transaction via Jito bundle or direct RPC."""
     
     if SEND_MODE == "rpc":
         rpc = await create_rpc()
         try:
-            # solana 0.39.x: send_raw_transaction takes bytes directly
             raw_bytes = bytes(swap_tx)
             txid = await rpc.send_raw_transaction(raw_bytes)
-            result = str(txid)
-            logger.info(f"Transaction sent via RPC: {result}")
+            result = str(txid.value) if hasattr(txid, 'value') else str(txid)
+            logger.info(f"Transaction sent via RPC: {result[:20]}...")
             return result
         except Exception as e:
             raise Exception(f"RPC send failed: {e}")
     
     else:
-        # Jito bundle
         if tip_tx is None:
             raise Exception("Tip transaction required for Jito")
             
@@ -277,9 +306,6 @@ async def send_transaction(swap_tx: VersionedTransaction, tip_tx: Optional[Versi
                     logger.warning(f"Jito rate limited, waiting {wait_time}s...")
                     await asyncio.sleep(wait_time)
                     continue
-                elif "could not be decoded" in error_msg.lower():
-                    logger.error("Jito cannot decode transaction. Try SEND_MODE=rpc")
-                    raise Exception(f"Jito decode error: {error_msg}")
                 else:
                     raise Exception(f"Jito error: {result['error']}")
             else:
@@ -288,20 +314,35 @@ async def send_transaction(swap_tx: VersionedTransaction, tip_tx: Optional[Versi
                 return bundle_id
         
         raise Exception("Jito bundle failed after retries")
+
 async def get_token_balance(rpc: AsyncClient, wallet: Pubkey, mint: Pubkey) -> int:
-    """Return raw token balance from associated token account."""
+    """Return raw token balance, retrying if ATA not yet created."""
     try:
         from spl.token.instructions import get_associated_token_address
         ata = get_associated_token_address(wallet, mint)
-        acc = await rpc.get_account_info(ata, commitment=Confirmed)
-        if acc.value is None:
-            return 0
-        data = acc.value.data
-        if len(data) < 72:
-            return 0
-        amount_bytes = data[64:72]
-        return int.from_bytes(amount_bytes, "little")
-    except Exception:
+        
+        # Retry up to 8 times with 3 second delays (24 seconds total)
+        for attempt in range(8):
+            try:
+                acc = await rpc.get_account_info(ata, commitment=Confirmed)
+                if acc.value is not None:
+                    data = acc.value.data
+                    if len(data) >= 72:
+                        amount_bytes = data[64:72]
+                        balance = int.from_bytes(amount_bytes, "little")
+                        if balance > 0:
+                            logger.info(f"Token balance confirmed: {balance}")
+                            return balance
+            except Exception:
+                pass
+            
+            if attempt < 7:
+                await asyncio.sleep(3)
+        
+        logger.warning("Token balance still 0 after retries")
+        return 0
+    except Exception as e:
+        logger.error(f"Error getting token balance: {e}")
         return 0
 
 # ----------------------------------------------------------------------
@@ -394,7 +435,7 @@ async def buy_with_jito(
     # 4. Blockhash
     blockhash_str = str(swap_tx.message.recent_blockhash)
 
-    # 5. Send (Jito or RPC)
+    # 5. Send
     if SEND_MODE == "rpc":
         txid = await send_transaction(swap_tx)
         return txid, swap_tx
@@ -475,7 +516,7 @@ async def ultimate_exit_monitor(
     remaining = initial_token_amount
     peak_sol = buy_price_sol
 
-    logger.info(f"Exit monitor started for {mint[:8]}...")
+    logger.info(f"Exit monitor started for {mint[:8]}... ({remaining} tokens)")
 
     for mult, fraction in target_multiples:
         while remaining > 0:
@@ -508,7 +549,7 @@ async def ultimate_exit_monitor(
             if current_sol >= buy_price_sol * mult:
                 sell_amount = int(initial_token_amount * fraction)
                 sell_amount = min(sell_amount, remaining)
-                logger.info(f"Selling {fraction*100:.0f}% at {mult}x")
+                logger.info(f"Selling {fraction*100:.0f}% at {mult}x (value: {current_sol:.4f} SOL)")
                 await sell_with_jito(mint, wallet, sell_amount, slippage_bps, tip_lamports)
                 remaining -= sell_amount
                 peak_sol = current_sol
@@ -579,14 +620,34 @@ async def main():
     logger.info("Starting Solana Meme Sniper Bot")
     logger.info(f"Wallet: {WALLET.pubkey()}")
     logger.info(f"Snipe amount: {SNIPE_AMOUNT_SOL} SOL")
+    logger.info(f"Gas reserve: {GAS_RESERVE_SOL} SOL")
     logger.info(f"Jito tip: {TIP_LAMPORTS} lamports")
     logger.info(f"Send mode: {SEND_MODE}")
     logger.info("=" * 60)
 
     rpc = await create_rpc()
+    
+    # Show initial balance
+    balance = await get_wallet_balance(rpc)
+    logger.info(f"Wallet balance: {balance:.4f} SOL")
+    logger.info(f"Available for trading: {max(0, balance - GAS_RESERVE_SOL):.4f} SOL")
+    logger.info("=" * 60)
 
     async for mint in discover_new_tokens():
-        logger.info(f"New token: {mint}")
+        # Check wallet balance before each trade
+        balance = await get_wallet_balance(rpc)
+        
+        if not can_afford_buy(balance):
+            logger.warning(
+                f"⚠️  Low balance ({balance:.4f} SOL). "
+                f"Need at least {SNIPE_AMOUNT_SOL + GAS_RESERVE_SOL + (TIP_LAMPORTS/1e9 if SEND_MODE=='jito' else 0):.4f} SOL. "
+                f"Waiting for balance to increase..."
+            )
+            # Wait 30 seconds before checking again
+            await asyncio.sleep(30)
+            continue
+        
+        logger.info(f"New token: {mint} (balance: {balance:.4f} SOL)")
 
         if not await safety_check(mint, rpc):
             logger.info(f"Safety failed for {mint[:8]}...")
@@ -602,20 +663,27 @@ async def main():
                 slippage_bps=SLIPPAGE_BPS,
                 tip_lamports=TIP_LAMPORTS,
             )
-            logger.info(f"Buy sent! TX: {txid}")
+            logger.info(f"✅ Buy sent! TX: {txid[:20]}...")
         except Exception as e:
-            logger.error(f"Buy failed: {e}")
+            error_str = str(e)
+            if "insufficient lamports" in error_str.lower() or "0x1" in error_str:
+                logger.error(f"Insufficient funds for transaction. Waiting for balance to recover.")
+                await asyncio.sleep(30)
+            else:
+                logger.error(f"Buy failed: {e}")
             continue
 
-        await asyncio.sleep(5)
-
+        # Wait and retry balance check
+        logger.info("Waiting for transaction confirmation...")
         token_amount = await get_token_balance(rpc, WALLET.pubkey(), Pubkey.from_string(mint))
+        
         if token_amount == 0:
-            logger.warning("No tokens received, skipping exit.")
+            logger.warning("No tokens received after retries, skipping exit.")
             continue
 
-        logger.info(f"Received {token_amount} tokens. Starting exit monitor...")
+        logger.info(f"✅ Received {token_amount} tokens. Starting exit monitor...")
 
+        # Start exit monitor as background task
         asyncio.create_task(
             ultimate_exit_monitor(
                 mint=mint,
