@@ -188,6 +188,15 @@ async def jupiter_swap(quote_response: dict, user_public_key: str) -> dict:
     raise Exception("Jupiter swap failed after retries")
 
 # ----------------------------------------------------------------------
+# Helper: Sign a VersionedTransaction
+# ----------------------------------------------------------------------
+
+def sign_versioned_tx(tx: VersionedTransaction, wallet: Keypair) -> VersionedTransaction:
+    """Sign a VersionedTransaction with the given wallet."""
+    signed_message = tx.message.sign([wallet])
+    return VersionedTransaction(signed_message, [wallet])
+
+# ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
 
@@ -246,7 +255,7 @@ async def send_jito_bundle(
                 continue
             elif "could not be decoded" in error_msg:
                 logger.warning("Transaction decode error, re-signing...")
-                swap_tx.sign([WALLET])
+                swap_tx = sign_versioned_tx(swap_tx, WALLET)
                 bundle[0] = base64.b64encode(bytes(swap_tx)).decode("utf-8")
                 payload["params"] = [bundle]
                 await asyncio.sleep(1)
@@ -360,8 +369,8 @@ async def buy_with_jito(
     swap_tx_bytes = base64.b64decode(tx_data["swapTransaction"])
     swap_tx = VersionedTransaction.from_bytes(swap_tx_bytes)
     
-    # 3. SIGN the transaction with our wallet
-    swap_tx.sign([wallet])
+    # 3. SIGN the transaction
+    swap_tx = sign_versioned_tx(swap_tx, wallet)
     
     # 4. Extract blockhash from the SIGNED transaction
     blockhash_str = str(swap_tx.message.recent_blockhash)
@@ -396,7 +405,7 @@ async def sell_with_jito(
     sell_tx = VersionedTransaction.from_bytes(sell_tx_bytes)
     
     # 3. SIGN the transaction
-    sell_tx.sign([wallet])
+    sell_tx = sign_versioned_tx(sell_tx, wallet)
 
     # 4. Extract blockhash
     blockhash_str = str(sell_tx.message.recent_blockhash)
