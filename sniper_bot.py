@@ -217,7 +217,7 @@ def create_tip_transaction(
 async def send_jito_bundle(
     swap_tx: VersionedTransaction, tip_tx: VersionedTransaction
 ) -> str:
-    """Send swap + tip as a Jito bundle, return bundle ID."""
+    """Send swap + tip as a Jito bundle, with retry on rate limits."""
     bundle = [
         base64.b64encode(bytes(swap_tx)).decode("utf-8"),
         base64.b64encode(bytes(tip_tx)).decode("utf-8"),
@@ -228,12 +228,35 @@ async def send_jito_bundle(
         "method": "sendBundle",
         "params": [bundle],
     }
-    async with aiohttp.ClientSession() as session:
-        async with session.post(JITO_BUNDLE_URL, json=payload, headers=JITO_AUTH_HEADER) as resp:
-            result = await resp.json()
-            if "error" in result:
+    
+    max_retries = 3
+    for attempt in range(max_retries):
+        async with aiohttp.ClientSession() as session:
+            async with session.post(JITO_BUNDLE_URL, json=payload, headers=JITO_AUTH_HEADER) as resp:
+                result = await resp.json()
+                
+        if "error" in result:
+            error_code = result["error"].get("code", 0)
+            error_msg = result["error"].get("message", "")
+            
+            if error_code == -32097 or "rate limited" in error_msg.lower():
+                wait_time = (attempt + 1) * 3
+                logger.warning(f"Jito rate limited, waiting {wait_time}s...")
+                await asyncio.sleep(wait_time)
+                continue
+            elif "could not be decoded" in error_msg:
+                logger.warning("Transaction decode error, re-signing...")
+                swap_tx.sign([WALLET])
+                bundle[0] = base64.b64encode(bytes(swap_tx)).decode("utf-8")
+                payload["params"] = [bundle]
+                await asyncio.sleep(1)
+                continue
+            else:
                 raise Exception(f"Jito error: {result['error']}")
+        else:
             return result["result"]
+    
+    raise Exception("Jito bundle failed after retries")
 
 async def get_token_balance(rpc: AsyncClient, wallet: Pubkey, mint: Pubkey) -> int:
     """Return raw token balance from associated token account."""
@@ -334,16 +357,20 @@ async def buy_with_jito(
     
     # 2. Swap transaction
     tx_data = await jupiter_swap(quote, str(wallet.pubkey()))
-    swap_tx = VersionedTransaction.from_bytes(base64.b64decode(tx_data["swapTransaction"]))
-
-    # 3. Extract blockhash
+    swap_tx_bytes = base64.b64decode(tx_data["swapTransaction"])
+    swap_tx = VersionedTransaction.from_bytes(swap_tx_bytes)
+    
+    # 3. SIGN the transaction with our wallet
+    swap_tx.sign([wallet])
+    
+    # 4. Extract blockhash from the SIGNED transaction
     blockhash_str = str(swap_tx.message.recent_blockhash)
 
-    # 4. Tip transaction
+    # 5. Tip transaction
     tip_account = TIP_ACCOUNTS[0]
     tip_tx = create_tip_transaction(wallet, tip_account, tip_lamports, blockhash_str)
 
-    # 5. Send bundle
+    # 6. Send bundle
     bundle_id = await send_jito_bundle(swap_tx, tip_tx)
     logger.info(f"Buy bundle sent: {bundle_id}")
     return bundle_id, swap_tx
@@ -365,16 +392,20 @@ async def sell_with_jito(
     
     # 2. Swap transaction
     tx_data = await jupiter_swap(quote, str(wallet.pubkey()))
-    sell_tx = VersionedTransaction.from_bytes(base64.b64decode(tx_data["swapTransaction"]))
+    sell_tx_bytes = base64.b64decode(tx_data["swapTransaction"])
+    sell_tx = VersionedTransaction.from_bytes(sell_tx_bytes)
+    
+    # 3. SIGN the transaction
+    sell_tx.sign([wallet])
 
-    # 3. Extract blockhash
+    # 4. Extract blockhash
     blockhash_str = str(sell_tx.message.recent_blockhash)
 
-    # 4. Tip
+    # 5. Tip
     tip_account = TIP_ACCOUNTS[0]
     tip_tx = create_tip_transaction(wallet, tip_account, tip_lamports, blockhash_str)
 
-    # 5. Bundle
+    # 6. Bundle
     bundle_id = await send_jito_bundle(sell_tx, tip_tx)
     logger.info(f"Sell bundle sent: {bundle_id}")
     return bundle_id, sell_tx
