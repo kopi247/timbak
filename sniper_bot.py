@@ -10,6 +10,7 @@ import base64
 import json
 import logging
 import os
+import random
 import sys
 import time
 import uuid
@@ -20,6 +21,7 @@ from dotenv import load_dotenv
 
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
+from solders.hash import Hash
 from solders.system_program import TransferParams, transfer
 from solders.transaction import VersionedTransaction
 from solders.message import MessageV0
@@ -73,6 +75,10 @@ TIP_ACCOUNTS = [
 JUPITER_QUOTE_URL = "https://api.jup.ag/swap/v1/quote"
 JUPITER_SWAP_URL = "https://api.jup.ag/swap/v1/swap"
 
+# Rate limiting for Jupiter API
+LAST_JUPITER_CALL = 0
+JUPITER_RATE_LIMIT = 1.5  # seconds between calls
+
 # Snipe settings
 SNIPE_AMOUNT_SOL = float(os.getenv("SNIPE_AMOUNT_SOL", "0.05"))
 SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "2500"))
@@ -98,26 +104,59 @@ IGNORE_MINTS = {
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 # ----------------------------------------------------------------------
-# Jupiter API Helpers (no SDK needed)
+# Rate Limiter
+# ----------------------------------------------------------------------
+
+async def rate_limited_jupiter_call():
+    """Ensure we don't exceed Jupiter API rate limits."""
+    global LAST_JUPITER_CALL
+    elapsed = time.time() - LAST_JUPITER_CALL
+    if elapsed < JUPITER_RATE_LIMIT:
+        wait = JUPITER_RATE_LIMIT - elapsed + random.uniform(0, 0.5)
+        await asyncio.sleep(wait)
+    LAST_JUPITER_CALL = time.time()
+
+# ----------------------------------------------------------------------
+# Jupiter API Helpers
 # ----------------------------------------------------------------------
 
 async def jupiter_quote(input_mint: str, output_mint: str, amount: int, slippage_bps: int) -> dict:
-    """Get a quote from Jupiter API."""
+    """Get a quote from Jupiter API with retry on rate limits."""
+    await rate_limited_jupiter_call()
+    
     params = {
         "inputMint": input_mint,
         "outputMint": output_mint,
         "amount": str(amount),
         "slippageBps": str(slippage_bps),
     }
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
-        async with session.get(JUPITER_QUOTE_URL, params=params) as resp:
-            if resp.status != 200:
-                error_text = await resp.text()
-                raise Exception(f"Jupiter quote error: {error_text}")
-            return await resp.json()
+    
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+                async with session.get(JUPITER_QUOTE_URL, params=params) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    elif resp.status == 429:
+                        wait_time = (attempt + 1) * 2
+                        logger.warning(f"Rate limited by Jupiter, waiting {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        error_text = await resp.text()
+                        raise Exception(f"Jupiter quote error: {error_text}")
+        except asyncio.TimeoutError:
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1)
+                continue
+            raise
+    raise Exception("Jupiter quote failed after retries")
 
 async def jupiter_swap(quote_response: dict, user_public_key: str) -> dict:
-    """Get swap transaction from Jupiter API."""
+    """Get swap transaction from Jupiter API with retry."""
+    await rate_limited_jupiter_call()
+    
     payload = {
         "quoteResponse": quote_response,
         "userPublicKey": user_public_key,
@@ -125,12 +164,28 @@ async def jupiter_swap(quote_response: dict, user_public_key: str) -> dict:
         "dynamicComputeUnitLimit": True,
         "prioritizationFeeLamports": "auto",
     }
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
-        async with session.post(JUPITER_SWAP_URL, json=payload) as resp:
-            if resp.status != 200:
-                error_text = await resp.text()
-                raise Exception(f"Jupiter swap error: {error_text}")
-            return await resp.json()
+    
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+                async with session.post(JUPITER_SWAP_URL, json=payload) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    elif resp.status == 429:
+                        wait_time = (attempt + 1) * 2
+                        logger.warning(f"Rate limited on swap, waiting {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        error_text = await resp.text()
+                        raise Exception(f"Jupiter swap error: {error_text}")
+        except asyncio.TimeoutError:
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1)
+                continue
+            raise
+    raise Exception("Jupiter swap failed after retries")
 
 # ----------------------------------------------------------------------
 # Helpers
@@ -155,7 +210,7 @@ def create_tip_transaction(
         payer=wallet.pubkey(),
         instructions=[ix],
         address_lookup_table_accounts=[],
-        recent_blockhash=Pubkey.from_string(recent_blockhash),
+        recent_blockhash=Hash.from_string(recent_blockhash),
     )
     return VersionedTransaction(msg, [wallet])
 
@@ -210,21 +265,18 @@ async def safety_check(mint: str, rpc: AsyncClient) -> bool:
                 if resp.status == 200:
                     data = await resp.json()
                     risks = data.get("risks", [])
-                    # Handle both string and int risk levels
                     for risk in risks:
                         level = risk.get("level", 0)
-                        # Convert to int if it's a string
                         if isinstance(level, str):
                             try:
                                 level = int(level)
                             except ValueError:
-                                level = 99  # unknown risk, fail
+                                level = 99
                         if level > MAX_RUGCHECK_RISK:
                             risk_name = risk.get("name", "Unknown")
                             logger.info(f"RugCheck risk: {risk_name} (level {level})")
                             return False
                 elif resp.status == 404:
-                    # No report yet - might be too new, but we'll allow it
                     logger.info(f"No RugCheck report yet for {mint[:8]}... (allowing)")
                 else:
                     logger.warning(f"RugCheck API error: {resp.status}")
@@ -243,7 +295,7 @@ async def safety_check(mint: str, rpc: AsyncClient) -> bool:
 
         data = acc.value.data
 
-        # Check mint authority (offset 0: 4 bytes option)
+        # Check mint authority
         if len(data) < 4:
             return False
         mint_auth_option = int.from_bytes(data[0:4], "little")
@@ -251,9 +303,7 @@ async def safety_check(mint: str, rpc: AsyncClient) -> bool:
             logger.info(f"Mint authority not renounced for {mint[:8]}...")
             return False
 
-        # Check freeze authority (offset 36: 4 bytes option)
-        # Skip freeze check - many new tokens have this temporarily
-        # and it's often renounced within minutes
+        # Check freeze authority (allow it temporarily)
         if len(data) > 39:
             freeze_auth_option = int.from_bytes(data[36:40], "little")
             if freeze_auth_option != 0:
@@ -264,7 +314,7 @@ async def safety_check(mint: str, rpc: AsyncClient) -> bool:
         return False
 
     return True
-    
+
 # ----------------------------------------------------------------------
 # Jito Bundled Buy
 # ----------------------------------------------------------------------
