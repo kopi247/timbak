@@ -19,6 +19,8 @@ from typing import Optional, Tuple, List
 import aiohttp
 from dotenv import load_dotenv
 
+from solana.rpc.types import TxOpts
+from solana.rpc.commitment import Processed
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.hash import Hash
@@ -233,19 +235,18 @@ async def send_transaction(swap_tx: VersionedTransaction, tip_tx: Optional[Versi
     """Send transaction via Jito bundle or direct RPC based on SEND_MODE."""
     
     if SEND_MODE == "rpc":
-        # Direct RPC send (no Jito, no tip)
         rpc = await create_rpc()
         try:
-            txid = await rpc.send_transaction(
-                swap_tx,
+            # Simple send with skip_preflight as keyword args
+            txid = await rpc.send_raw_transaction(
+                bytes(swap_tx),
                 opts={"skip_preflight": True, "max_retries": 2}
             )
             result = str(txid)
             logger.info(f"Transaction sent via RPC: {result}")
             return result
         except Exception as e:
-            raise Exception(f"RPC send failed: {e}")
-    
+            raise Exception(f"RPC send failed: {e}")    
     else:
         # Jito bundle
         if tip_tx is None:
