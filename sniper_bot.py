@@ -70,8 +70,8 @@ TIP_ACCOUNTS = [
 ]
 
 # Jupiter API
-JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
-JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
+JUPITER_QUOTE_URL = "https://api.jup.ag/swap/v1/quote"
+JUPITER_SWAP_URL = "https://api.jup.ag/swap/v1/swap"
 
 # Snipe settings
 SNIPE_AMOUNT_SOL = float(os.getenv("SNIPE_AMOUNT_SOL", "0.05"))
@@ -109,7 +109,7 @@ async def jupiter_quote(input_mint: str, output_mint: str, amount: int, slippage
         "amount": str(amount),
         "slippageBps": str(slippage_bps),
     }
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
         async with session.get(JUPITER_QUOTE_URL, params=params) as resp:
             if resp.status != 200:
                 error_text = await resp.text()
@@ -117,7 +117,7 @@ async def jupiter_quote(input_mint: str, output_mint: str, amount: int, slippage
             return await resp.json()
 
 async def jupiter_swap(quote_response: dict, user_public_key: str) -> dict:
-    """Get swap transaction from Jupiter."""
+    """Get swap transaction from Jupiter API."""
     payload = {
         "quoteResponse": quote_response,
         "userPublicKey": user_public_key,
@@ -125,7 +125,7 @@ async def jupiter_swap(quote_response: dict, user_public_key: str) -> dict:
         "dynamicComputeUnitLimit": True,
         "prioritizationFeeLamports": "auto",
     }
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
         async with session.post(JUPITER_SWAP_URL, json=payload) as resp:
             if resp.status != 200:
                 error_text = await resp.text()
