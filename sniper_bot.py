@@ -5,7 +5,7 @@ Uses Jupiter API directly + Jito bundles for stealth execution.
 Smart exit: scaling out, trailing stop, market-cap & time failsafes.
 Position persistence: survives restarts.
 Gas reserve: maintains minimum SOL balance to cover fees.
-Helius RPC: automatic backrun rebates (no extra code needed).
+Token age filter: only snipes tokens between MIN_TOKEN_AGE and MAX_TOKEN_AGE seconds old.
 """
 
 import asyncio
@@ -91,6 +91,10 @@ SNIPE_AMOUNT_SOL = float(os.getenv("SNIPE_AMOUNT_SOL", "0.05"))
 SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "2500"))
 TIP_LAMPORTS = int(os.getenv("TIP_LAMPORTS", "500000"))
 MAX_RUGCHECK_RISK = int(os.getenv("MAX_RUGCHECK_RISK", "0"))
+
+# Token age filter (in seconds)
+MIN_TOKEN_AGE = int(os.getenv("MIN_TOKEN_AGE", "5"))      # Minimum 5 seconds old
+MAX_TOKEN_AGE = int(os.getenv("MAX_TOKEN_AGE", "300"))    # Maximum 5 minutes old
 
 # Gas reserve settings
 GAS_RESERVE_SOL = float(os.getenv("GAS_RESERVE_SOL", "0.01"))
@@ -412,11 +416,48 @@ async def get_token_balance(rpc: AsyncClient, wallet: Pubkey, mint: Pubkey) -> i
         return 0
 
 # ----------------------------------------------------------------------
+# Token Age Check
+# ----------------------------------------------------------------------
+
+async def get_token_age(mint: str) -> Optional[float]:
+    """Get token age in seconds from DexScreener. Returns None if unavailable."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+            async with session.get(url, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("pairs") and len(data["pairs"]) > 0:
+                        pair = data["pairs"][0]
+                        pair_created = pair.get("pairCreatedAt", 0)
+                        if pair_created > 0:
+                            age_seconds = time.time() - (pair_created / 1000)
+                            return age_seconds
+    except Exception:
+        pass
+    return None
+
+# ----------------------------------------------------------------------
 # Safety Checks
 # ----------------------------------------------------------------------
 
 async def safety_check(mint: str, rpc: AsyncClient) -> bool:
-    """Return True if token passes all checks."""
+    """Return True if token passes all checks including age filter."""
+    
+    # 0. Token Age Check (NEW)
+    age = await get_token_age(mint)
+    if age is not None:
+        if age < MIN_TOKEN_AGE:
+            logger.info(f"Token too new: {age:.0f}s old (min {MIN_TOKEN_AGE}s) - {mint[:8]}...")
+            return False
+        if age > MAX_TOKEN_AGE:
+            logger.info(f"Token too old: {age/60:.0f}min old (max {MAX_TOKEN_AGE/60:.0f}min) - {mint[:8]}...")
+            return False
+        logger.info(f"Token age: {age:.0f}s ✅")
+    else:
+        logger.info(f"Token age unknown - allowing - {mint[:8]}...")
+    
+    # 1. RugCheck API
     try:
         async with aiohttp.ClientSession() as session:
             url = f"https://api.rugcheck.xyz/v1/tokens/{mint}/report"
@@ -444,6 +485,7 @@ async def safety_check(mint: str, rpc: AsyncClient) -> bool:
     except Exception as e:
         logger.warning(f"RugCheck error: {e}")
 
+    # 2. On-chain checks
     try:
         mint_pub = Pubkey.from_string(mint)
         acc = await rpc.get_account_info(mint_pub, commitment=Confirmed)
@@ -718,6 +760,7 @@ async def main():
     logger.info(f"Snipe amount: {SNIPE_AMOUNT_SOL} SOL")
     logger.info(f"Gas reserve: {GAS_RESERVE_SOL} SOL")
     logger.info(f"Send mode: {SEND_MODE}")
+    logger.info(f"Token age filter: {MIN_TOKEN_AGE}s - {MAX_TOKEN_AGE}s")
     if SEND_MODE == "jito":
         logger.info(f"Jito tip: {TIP_LAMPORTS} lamports")
     logger.info("=" * 60)
