@@ -241,7 +241,7 @@ async def jupiter_swap(quote_response: dict, user_public_key: str) -> dict:
     """Get swap transaction from Jupiter API with retry."""
     await rate_limited_jupiter_call()
     
-        payload = {
+    payload = {
         "quoteResponse": quote_response,
         "userPublicKey": user_public_key,
         "wrapAndUnwrapSol": True,
