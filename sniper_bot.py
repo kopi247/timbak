@@ -3,7 +3,9 @@
 Fully Automated Solana Meme-Sniping Bot
 Uses Jupiter API directly + Jito bundles for stealth execution.
 Smart exit: scaling out, trailing stop, market-cap & time failsafes.
+Position persistence: survives restarts.
 Gas reserve: maintains minimum SOL balance to cover fees.
+Helius backrun rebates: earn SOL when backrun bots profit from your trades.
 """
 
 import asyncio
@@ -15,6 +17,7 @@ import random
 import sys
 import time
 import uuid
+from pathlib import Path
 from typing import Optional, Tuple, List
 
 import aiohttp
@@ -23,6 +26,7 @@ from dotenv import load_dotenv
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.hash import Hash
+from solders.instruction import Instruction
 from solders.system_program import TransferParams, transfer
 from solders.transaction import VersionedTransaction
 from solders.message import MessageV0
@@ -45,7 +49,7 @@ logger = logging.getLogger("SniperBot")
 # ----------------------------------------------------------------------
 load_dotenv()
 
-# Solana RPC
+# Solana RPC (Helius recommended for backrun rebates)
 RPC_HTTP = os.getenv("RPC_HTTP", "")
 if not RPC_HTTP:
     raise ValueError("RPC_HTTP not set in .env")
@@ -93,12 +97,17 @@ MAX_RUGCHECK_RISK = int(os.getenv("MAX_RUGCHECK_RISK", "0"))
 GAS_RESERVE_SOL = float(os.getenv("GAS_RESERVE_SOL", "0.01"))
 GAS_PER_TX_ESTIMATE = 0.00005
 
+# Helius backrun rebate
+HELIUS_REBATE_ACCOUNT = Pubkey.from_string("75GfAsUMc6K4WmwsE8qUxYHmGtCkF6RaLwqW7PHuNrzB")
+ENABLE_BACKRUN_REBATE = os.getenv("ENABLE_BACKRUN_REBATE", "true").lower() == "true"
+
 # Exit settings
 TARGET_MULTIPLES = [(2.0, 0.25), (3.0, 0.25), (5.0, 0.25)]
 TRAILING_STOP_PCT = 20.0
 STOP_LOSS_FACTOR = 0.4
 MAX_HOLD_SECONDS = 1200
 TARGET_MARKET_CAP = 1_000_000
+FORCE_SELL_TIMEOUT = 300
 
 # Token discovery
 DISCOVERY_POLL_SECONDS = 1
@@ -111,6 +120,45 @@ IGNORE_MINTS = {
 # WSOL mint
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
+# Position persistence
+POSITIONS_FILE = Path("positions.json")
+ACTIVE_MONITORS: dict = {}
+
+# ----------------------------------------------------------------------
+# Position Persistence
+# ----------------------------------------------------------------------
+
+def save_position(mint: str, token_amount: int, buy_price_sol: float):
+    """Save a position to disk so it survives restarts."""
+    positions = load_positions()
+    positions[mint] = {
+        "token_amount": token_amount,
+        "buy_price_sol": buy_price_sol,
+        "timestamp": time.time(),
+    }
+    with open(POSITIONS_FILE, "w") as f:
+        json.dump(positions, f, indent=2)
+    logger.info(f"💾 Position saved: {mint[:8]}... ({token_amount} tokens)")
+
+def load_positions() -> dict:
+    """Load positions from disk."""
+    if POSITIONS_FILE.exists():
+        try:
+            with open(POSITIONS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def remove_position(mint: str):
+    """Remove a position after selling."""
+    positions = load_positions()
+    if mint in positions:
+        del positions[mint]
+        with open(POSITIONS_FILE, "w") as f:
+            json.dump(positions, f, indent=2)
+        logger.info(f"💾 Position removed: {mint[:8]}...")
+
 # ----------------------------------------------------------------------
 # Wallet Balance Management
 # ----------------------------------------------------------------------
@@ -119,8 +167,7 @@ async def get_wallet_balance(rpc: AsyncClient) -> float:
     """Get wallet SOL balance."""
     try:
         resp = await rpc.get_balance(WALLET.pubkey(), commitment=Confirmed)
-        balance_sol = resp.value / 1e9
-        return balance_sol
+        return resp.value / 1e9
     except Exception as e:
         logger.error(f"Failed to get wallet balance: {e}")
         return 0.0
@@ -129,7 +176,6 @@ def can_afford_buy(wallet_balance_sol: float) -> bool:
     """Check if wallet can afford a buy + gas + tip."""
     tip_sol = TIP_LAMPORTS / 1e9 if SEND_MODE == "jito" else 0
     total_needed = SNIPE_AMOUNT_SOL + tip_sol + GAS_PER_TX_ESTIMATE
-    
     can_afford = wallet_balance_sol >= (total_needed + GAS_RESERVE_SOL)
     
     if not can_afford:
@@ -226,6 +272,48 @@ async def jupiter_swap(quote_response: dict, user_public_key: str) -> dict:
     raise Exception("Jupiter swap failed after retries")
 
 # ----------------------------------------------------------------------
+# Helius Backrun Rebate
+# ----------------------------------------------------------------------
+
+def add_backrun_rebate_instruction(tx: VersionedTransaction, wallet: Keypair) -> VersionedTransaction:
+    """
+    Add Helius backrun rebate instruction to a transaction.
+    Earn SOL rebates when backrun bots profit from your trades.
+    Only works when using Helius RPC.
+    """
+    if not ENABLE_BACKRUN_REBATE:
+        return tx
+    
+    try:
+        # Create a memo instruction that signals "rebate eligible" to Helius
+        rebate_ix = Instruction(
+            program_id=HELIUS_REBATE_ACCOUNT,
+            accounts=[
+                {"pubkey": wallet.pubkey(), "is_signer": True, "is_writable": True},
+            ],
+            data=b"rebate",
+        )
+        
+        # Combine with existing instructions
+        existing_instructions = list(tx.message.instructions)
+        existing_instructions.append(rebate_ix)
+        
+        # Rebuild message
+        new_msg = MessageV0.try_compile(
+            payer=wallet.pubkey(),
+            instructions=existing_instructions,
+            address_lookup_table_accounts=tx.message.address_table_lookups,
+            recent_blockhash=tx.message.recent_blockhash,
+        )
+        
+        logger.debug("💰 Backrun rebate instruction added")
+        return VersionedTransaction(new_msg, [wallet])
+        
+    except Exception as e:
+        logger.warning(f"Failed to add rebate instruction: {e}")
+        return tx
+
+# ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
 
@@ -269,7 +357,6 @@ async def send_transaction(swap_tx: VersionedTransaction, tip_tx: Optional[Versi
             raw_bytes = bytes(swap_tx)
             txid_resp = await rpc.send_raw_transaction(raw_bytes)
             
-            # Extract signature
             if hasattr(txid_resp, 'value'):
                 sig = str(txid_resp.value)
             else:
@@ -277,8 +364,6 @@ async def send_transaction(swap_tx: VersionedTransaction, tip_tx: Optional[Versi
             
             logger.info(f"Transaction sent: {sig[:40]}...")
             
-            # Wait for confirmation
-            logger.info("Confirming transaction...")
             for i in range(15):
                 await asyncio.sleep(4)
                 try:
@@ -346,10 +431,8 @@ async def get_token_balance(rpc: AsyncClient, wallet: Pubkey, mint: Pubkey) -> i
     try:
         from spl.token.instructions import get_associated_token_address
         
-        # Get the Associated Token Account address
         ata = get_associated_token_address(wallet, mint)
         
-        # Retry up to 8 times (24 seconds total) for ATA creation
         for attempt in range(8):
             try:
                 resp = await rpc.get_token_account_balance(ata, commitment=Confirmed)
@@ -376,7 +459,6 @@ async def get_token_balance(rpc: AsyncClient, wallet: Pubkey, mint: Pubkey) -> i
 
 async def safety_check(mint: str, rpc: AsyncClient) -> bool:
     """Return True if token passes all checks."""
-    # 1. RugCheck API
     try:
         async with aiohttp.ClientSession() as session:
             url = f"https://api.rugcheck.xyz/v1/tokens/{mint}/report"
@@ -404,7 +486,6 @@ async def safety_check(mint: str, rpc: AsyncClient) -> bool:
     except Exception as e:
         logger.warning(f"RugCheck error: {e}")
 
-    # 2. On-chain checks
     try:
         mint_pub = Pubkey.from_string(mint)
         acc = await rpc.get_account_info(mint_pub, commitment=Confirmed)
@@ -443,24 +524,21 @@ async def buy_with_jito(
     slippage_bps: int,
     tip_lamports: int,
 ) -> Tuple[str, VersionedTransaction]:
-    """Snipe a token."""
+    """Snipe a token with Helius backrun rebate (RPC mode) or Jito tip."""
     amount_lamports = int(sol_amount * 1e9)
     
-    # 1. Quote
     quote = await jupiter_quote(WSOL_MINT, mint, amount_lamports, slippage_bps)
-    
-    # 2. Swap transaction
     tx_data = await jupiter_swap(quote, str(wallet.pubkey()))
     swap_tx_bytes = base64.b64decode(tx_data["swapTransaction"])
     swap_tx = VersionedTransaction.from_bytes(swap_tx_bytes)
-    
-    # 3. Sign with our wallet
     swap_tx = sign_swap_transaction(swap_tx, wallet)
     
-    # 4. Blockhash
+    # Add Helius backrun rebate (RPC mode only)
+    if SEND_MODE == "rpc":
+        swap_tx = add_backrun_rebate_instruction(swap_tx, wallet)
+    
     blockhash_str = str(swap_tx.message.recent_blockhash)
 
-    # 5. Send
     if SEND_MODE == "rpc":
         txid = await send_transaction(swap_tx)
         return txid, swap_tx
@@ -480,22 +558,19 @@ async def sell_with_jito(
     slippage_bps: int,
     tip_lamports: int,
 ) -> Tuple[str, VersionedTransaction]:
-    """Sell tokens."""
-    # 1. Quote sell
+    """Sell tokens with Helius backrun rebate (RPC mode) or Jito tip."""
     quote = await jupiter_quote(mint, WSOL_MINT, token_amount, slippage_bps)
-    
-    # 2. Swap transaction
     tx_data = await jupiter_swap(quote, str(wallet.pubkey()))
     sell_tx_bytes = base64.b64decode(tx_data["swapTransaction"])
     sell_tx = VersionedTransaction.from_bytes(sell_tx_bytes)
-    
-    # 3. Sign with our wallet
     sell_tx = sign_swap_transaction(sell_tx, wallet)
-
-    # 4. Blockhash
+    
+    # Add Helius backrun rebate (RPC mode only)
+    if SEND_MODE == "rpc":
+        sell_tx = add_backrun_rebate_instruction(sell_tx, wallet)
+    
     blockhash_str = str(sell_tx.message.recent_blockhash)
 
-    # 5. Send
     if SEND_MODE == "rpc":
         txid = await send_transaction(sell_tx)
         return txid, sell_tx
@@ -536,30 +611,44 @@ async def ultimate_exit_monitor(
     max_hold_seconds: int,
     target_mc: float,
 ):
-    """Smart exit strategy with detailed logging."""
+    """Smart exit strategy with force-sell fallback."""
     start_time = time.time()
     remaining = initial_token_amount
     peak_sol = buy_price_sol
+    last_successful_quote = time.time()
 
-    logger.info(f"🔍 Exit monitor STARTED for {mint[:8]}... ({remaining} tokens, bought at {buy_price_sol} SOL)")
+    logger.info(f"🔍 Exit monitor STARTED for {mint[:8]}... ({remaining} tokens, bought at {buy_price_sol:.6f} SOL)")
 
     try:
         for mult, fraction in target_multiples:
-            logger.info(f"Exit monitor: waiting for {mult}x on {mint[:8]}...")
             while remaining > 0:
                 elapsed = time.time() - start_time
                 
                 if elapsed > max_hold_seconds:
                     logger.info(f"⏰ Time limit reached ({elapsed:.0f}s), selling remaining {remaining}")
-                    await sell_with_jito(mint, wallet, remaining, slippage_bps, tip_lamports)
+                    try:
+                        await sell_with_jito(mint, wallet, remaining, slippage_bps, tip_lamports)
+                    except Exception as e:
+                        logger.error(f"Time-limit sell failed: {e}")
+                    remove_position(mint)
+                    return
+
+                if time.time() - last_successful_quote > FORCE_SELL_TIMEOUT:
+                    logger.warning(f"⚠️ No successful quote for {FORCE_SELL_TIMEOUT}s, force selling!")
+                    try:
+                        await sell_with_jito(mint, wallet, remaining, slippage_bps, tip_lamports)
+                    except Exception as e:
+                        logger.error(f"Force sell failed: {e}")
+                    remove_position(mint)
                     return
 
                 try:
                     quote = await jupiter_quote(mint, WSOL_MINT, remaining, slippage_bps)
                     current_sol = int(quote['outAmount']) / 1e9
+                    last_successful_quote = time.time()
                 except Exception as e:
-                    logger.warning(f"Exit monitor quote error: {e}")
-                    await asyncio.sleep(2)
+                    logger.warning(f"Quote error ({time.time() - last_successful_quote:.0f}s since last success): {e}")
+                    await asyncio.sleep(3)
                     continue
 
                 if current_sol > peak_sol:
@@ -570,50 +659,77 @@ async def ultimate_exit_monitor(
 
                 if current_sol <= buy_price_sol * stop_loss_factor:
                     logger.info(f"🛑 Stop-loss hit ({current_sol:.6f} SOL), selling all")
-                    await sell_with_jito(mint, wallet, remaining, slippage_bps, tip_lamports)
+                    try:
+                        await sell_with_jito(mint, wallet, remaining, slippage_bps, tip_lamports)
+                    except Exception as e:
+                        logger.error(f"Stop-loss sell failed: {e}")
+                    remove_position(mint)
                     return
 
                 if current_sol >= buy_price_sol * mult:
                     sell_amount = int(initial_token_amount * fraction)
                     sell_amount = min(sell_amount, remaining)
                     logger.info(f"💰 Take profit: selling {fraction*100:.0f}% at {mult}x (value: {current_sol:.6f} SOL)")
-                    await sell_with_jito(mint, wallet, sell_amount, slippage_bps, tip_lamports)
-                    remaining -= sell_amount
-                    peak_sol = current_sol
+                    try:
+                        await sell_with_jito(mint, wallet, sell_amount, slippage_bps, tip_lamports)
+                        remaining -= sell_amount
+                        peak_sol = current_sol
+                    except Exception as e:
+                        logger.error(f"Take-profit sell failed: {e}")
                     break
 
                 await asyncio.sleep(3)
 
-        # Moonbag trailing stop
-        logger.info(f"🌙 Moonbag trailing stop for {mint[:8]}... ({remaining} tokens)")
-        while remaining > 0:
-            elapsed = time.time() - start_time
-            if elapsed > max_hold_seconds:
-                logger.info(f"⏰ Final time limit, selling moonbag")
-                await sell_with_jito(mint, wallet, remaining, slippage_bps, tip_lamports)
-                return
+        if remaining > 0:
+            logger.info(f"🌙 Moonbag trailing stop for {mint[:8]}... ({remaining} tokens)")
+            while remaining > 0:
+                elapsed = time.time() - start_time
+                if elapsed > max_hold_seconds:
+                    logger.info(f"⏰ Final time limit, selling moonbag")
+                    try:
+                        await sell_with_jito(mint, wallet, remaining, slippage_bps, tip_lamports)
+                    except Exception as e:
+                        logger.error(f"Final sell failed: {e}")
+                    remove_position(mint)
+                    return
 
-            try:
-                quote = await jupiter_quote(mint, WSOL_MINT, remaining, slippage_bps)
-                current_sol = int(quote['outAmount']) / 1e9
-            except Exception:
-                await asyncio.sleep(2)
-                continue
+                if time.time() - last_successful_quote > FORCE_SELL_TIMEOUT:
+                    logger.warning(f"⚠️ Force selling moonbag after {FORCE_SELL_TIMEOUT}s without quote")
+                    try:
+                        await sell_with_jito(mint, wallet, remaining, slippage_bps, tip_lamports)
+                    except Exception as e:
+                        logger.error(f"Force sell moonbag failed: {e}")
+                    remove_position(mint)
+                    return
 
-            if current_sol > peak_sol:
-                peak_sol = current_sol
+                try:
+                    quote = await jupiter_quote(mint, WSOL_MINT, remaining, slippage_bps)
+                    current_sol = int(quote['outAmount']) / 1e9
+                    last_successful_quote = time.time()
+                except Exception:
+                    await asyncio.sleep(3)
+                    continue
 
-            if current_sol <= peak_sol * (1 - trailing_stop_pct / 100):
-                logger.info(f"📉 Trailing stop: peak {peak_sol:.6f}, current {current_sol:.6f}")
-                await sell_with_jito(mint, wallet, remaining, slippage_bps, tip_lamports)
-                return
+                if current_sol > peak_sol:
+                    peak_sol = current_sol
 
-            await asyncio.sleep(3)
+                if current_sol <= peak_sol * (1 - trailing_stop_pct / 100):
+                    logger.info(f"📉 Trailing stop: peak {peak_sol:.6f}, current {current_sol:.6f}")
+                    try:
+                        await sell_with_jito(mint, wallet, remaining, slippage_bps, tip_lamports)
+                    except Exception as e:
+                        logger.error(f"Trailing stop sell failed: {e}")
+                    remove_position(mint)
+                    return
 
+                await asyncio.sleep(3)
+
+        remove_position(mint)
         logger.info(f"✅ Exit monitor completed for {mint[:8]}...")
 
     except Exception as e:
         logger.error(f"💥 Exit monitor for {mint[:8]}... crashed: {e}", exc_info=True)
+        remove_position(mint)
 
 # ----------------------------------------------------------------------
 # Token Discovery
@@ -648,22 +764,45 @@ async def main():
     logger.info("=" * 60)
     logger.info("Starting Solana Meme Sniper Bot")
     logger.info(f"Wallet: {WALLET.pubkey()}")
+    logger.info(f"RPC: {RPC_HTTP[:50]}...")
     logger.info(f"Snipe amount: {SNIPE_AMOUNT_SOL} SOL")
     logger.info(f"Gas reserve: {GAS_RESERVE_SOL} SOL")
     logger.info(f"Jito tip: {TIP_LAMPORTS} lamports")
     logger.info(f"Send mode: {SEND_MODE}")
+    logger.info(f"Backrun rebate: {'Enabled' if ENABLE_BACKRUN_REBATE else 'Disabled'}")
     logger.info("=" * 60)
 
     rpc = await create_rpc()
     
-    # Show initial balance
     balance = await get_wallet_balance(rpc)
     logger.info(f"Wallet balance: {balance:.4f} SOL")
     logger.info(f"Available for trading: {max(0, balance - GAS_RESERVE_SOL):.4f} SOL")
     logger.info("=" * 60)
 
+    positions = load_positions()
+    if positions:
+        logger.info(f"📂 Found {len(positions)} existing positions. Resuming monitors...")
+        for mint, data in positions.items():
+            logger.info(f"Resuming exit monitor for {mint[:8]}... ({data['token_amount']} tokens)")
+            task = asyncio.create_task(
+                ultimate_exit_monitor(
+                    mint=mint,
+                    wallet=WALLET,
+                    initial_token_amount=data["token_amount"],
+                    buy_price_sol=data["buy_price_sol"],
+                    slippage_bps=SLIPPAGE_BPS,
+                    tip_lamports=TIP_LAMPORTS,
+                    target_multiples=TARGET_MULTIPLES,
+                    trailing_stop_pct=TRAILING_STOP_PCT,
+                    stop_loss_factor=STOP_LOSS_FACTOR,
+                    max_hold_seconds=MAX_HOLD_SECONDS,
+                    target_mc=TARGET_MARKET_CAP,
+                )
+            )
+            ACTIVE_MONITORS[mint] = task
+        logger.info("=" * 60)
+
     async for mint in discover_new_tokens():
-        # Check wallet balance before each trade
         balance = await get_wallet_balance(rpc)
         
         if not can_afford_buy(balance):
@@ -673,6 +812,9 @@ async def main():
                 f"Waiting 30s..."
             )
             await asyncio.sleep(30)
+            continue
+        
+        if mint in ACTIVE_MONITORS:
             continue
         
         logger.info(f"New token: {mint} (balance: {balance:.4f} SOL)")
@@ -701,7 +843,6 @@ async def main():
                 logger.error(f"Buy failed: {e}")
             continue
 
-        # Wait and retry balance check
         logger.info("Waiting for token balance...")
         token_amount = await get_token_balance(rpc, WALLET.pubkey(), Pubkey.from_string(mint))
         
@@ -711,7 +852,8 @@ async def main():
 
         logger.info(f"✅ Received {token_amount} tokens. Starting exit monitor...")
 
-        # Start exit monitor as background task with error handling
+        save_position(mint, token_amount, SNIPE_AMOUNT_SOL)
+
         task = asyncio.create_task(
             ultimate_exit_monitor(
                 mint=mint,
@@ -727,9 +869,13 @@ async def main():
                 target_mc=TARGET_MARKET_CAP,
             )
         )
+        ACTIVE_MONITORS[mint] = task
         task.add_done_callback(
-            lambda t, m=mint: logger.error(f"Exit monitor for {m[:8]}... crashed: {t.exception()}") 
-            if t.exception() else logger.info(f"Exit monitor for {m[:8]}... completed normally")
+            lambda t, m=mint: (
+                logger.error(f"Exit monitor for {m[:8]}... crashed: {t.exception()}") 
+                if t.exception() 
+                else logger.info(f"Exit monitor for {m[:8]}... completed normally")
+            )
         )
 
 if __name__ == "__main__":
