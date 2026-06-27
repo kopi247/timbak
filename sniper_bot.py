@@ -285,13 +285,16 @@ def add_backrun_rebate_instruction(tx: VersionedTransaction, wallet: Keypair) ->
         return tx
     
     try:
-        # Create a memo instruction that signals "rebate eligible" to Helius
+        from solders.instruction import AccountMeta
+        
+        # Create a simple memo instruction that signals "rebate eligible" to Helius
+        # Using a no-op transfer of 0 lamports to the rebate account
         rebate_ix = Instruction(
-            program_id=HELIUS_REBATE_ACCOUNT,
+            program_id=Pubkey.from_string("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"),  # Memo program
             accounts=[
-                {"pubkey": wallet.pubkey(), "is_signer": True, "is_writable": True},
+                AccountMeta(pubkey=wallet.pubkey(), is_signer=True, is_writable=False),
             ],
-            data=b"rebate",
+            data=b"Helius rebate",  # Memo text signalling rebate eligibility
         )
         
         # Combine with existing instructions
@@ -312,7 +315,7 @@ def add_backrun_rebate_instruction(tx: VersionedTransaction, wallet: Keypair) ->
     except Exception as e:
         logger.warning(f"Failed to add rebate instruction: {e}")
         return tx
-
+        
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
