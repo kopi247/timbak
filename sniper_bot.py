@@ -241,14 +241,19 @@ async def jupiter_swap(quote_response: dict, user_public_key: str) -> dict:
     """Get swap transaction from Jupiter API with retry."""
     await rate_limited_jupiter_call()
     
-    payload = {
+        payload = {
         "quoteResponse": quote_response,
         "userPublicKey": user_public_key,
         "wrapAndUnwrapSol": True,
         "dynamicComputeUnitLimit": True,
-        "prioritizationFeeLamports": "auto",
+        "prioritizationFeeLamports": {
+            "priorityLevelWithMaxLamports": {
+                "maxLamports": 500000,      # 0.0005 SOL max priority fee
+                "priorityLevel": "veryHigh"  # aggressive priority
+            }
+        },
     }
-    
+
     max_retries = 3
     for attempt in range(max_retries):
         try:
