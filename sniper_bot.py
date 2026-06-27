@@ -5,7 +5,7 @@ Uses Jupiter API directly + Jito bundles for stealth execution.
 Smart exit: scaling out, trailing stop, market-cap & time failsafes.
 Position persistence: survives restarts.
 Gas reserve: maintains minimum SOL balance to cover fees.
-Helius backrun rebates: earn SOL when backrun bots profit from your trades.
+Helius RPC: automatic backrun rebates (no extra code needed).
 """
 
 import asyncio
@@ -26,7 +26,6 @@ from dotenv import load_dotenv
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.hash import Hash
-from solders.instruction import Instruction
 from solders.system_program import TransferParams, transfer
 from solders.transaction import VersionedTransaction
 from solders.message import MessageV0
@@ -49,7 +48,7 @@ logger = logging.getLogger("SniperBot")
 # ----------------------------------------------------------------------
 load_dotenv()
 
-# Solana RPC (Helius recommended for backrun rebates)
+# Solana RPC (Helius recommended - automatic backrun rebates)
 RPC_HTTP = os.getenv("RPC_HTTP", "")
 if not RPC_HTTP:
     raise ValueError("RPC_HTTP not set in .env")
@@ -96,10 +95,6 @@ MAX_RUGCHECK_RISK = int(os.getenv("MAX_RUGCHECK_RISK", "0"))
 # Gas reserve settings
 GAS_RESERVE_SOL = float(os.getenv("GAS_RESERVE_SOL", "0.01"))
 GAS_PER_TX_ESTIMATE = 0.00005
-
-# Helius backrun rebate
-HELIUS_REBATE_ACCOUNT = Pubkey.from_string("75GfAsUMc6K4WmwsE8qUxYHmGtCkF6RaLwqW7PHuNrzB")
-ENABLE_BACKRUN_REBATE = os.getenv("ENABLE_BACKRUN_REBATE", "true").lower() == "true"
 
 # Exit settings
 TARGET_MULTIPLES = [(2.0, 0.25), (3.0, 0.25), (5.0, 0.25)]
@@ -248,12 +243,12 @@ async def jupiter_swap(quote_response: dict, user_public_key: str) -> dict:
         "dynamicComputeUnitLimit": True,
         "prioritizationFeeLamports": {
             "priorityLevelWithMaxLamports": {
-                "maxLamports": 500000,      # 0.0005 SOL max priority fee
-                "priorityLevel": "veryHigh"  # aggressive priority
+                "maxLamports": 500000,
+                "priorityLevel": "veryHigh"
             }
         },
     }
-
+    
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -276,51 +271,6 @@ async def jupiter_swap(quote_response: dict, user_public_key: str) -> dict:
             raise
     raise Exception("Jupiter swap failed after retries")
 
-# ----------------------------------------------------------------------
-# Helius Backrun Rebate
-# ----------------------------------------------------------------------
-
-def add_backrun_rebate_instruction(tx: VersionedTransaction, wallet: Keypair) -> VersionedTransaction:
-    """
-    Add Helius backrun rebate instruction to a transaction.
-    Earn SOL rebates when backrun bots profit from your trades.
-    Only works when using Helius RPC.
-    """
-    if not ENABLE_BACKRUN_REBATE:
-        return tx
-    
-    try:
-        from solders.instruction import AccountMeta
-        
-        # Create a simple memo instruction that signals "rebate eligible" to Helius
-        # Using a no-op transfer of 0 lamports to the rebate account
-        rebate_ix = Instruction(
-            program_id=Pubkey.from_string("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"),  # Memo program
-            accounts=[
-                AccountMeta(pubkey=wallet.pubkey(), is_signer=True, is_writable=False),
-            ],
-            data=b"Helius rebate",  # Memo text signalling rebate eligibility
-        )
-        
-        # Combine with existing instructions
-        existing_instructions = list(tx.message.instructions)
-        existing_instructions.append(rebate_ix)
-        
-        # Rebuild message
-        new_msg = MessageV0.try_compile(
-            payer=wallet.pubkey(),
-            instructions=existing_instructions,
-            address_lookup_table_accounts=tx.message.address_table_lookups,
-            recent_blockhash=tx.message.recent_blockhash,
-        )
-        
-        logger.debug("💰 Backrun rebate instruction added")
-        return VersionedTransaction(new_msg, [wallet])
-        
-    except Exception as e:
-        logger.warning(f"Failed to add rebate instruction: {e}")
-        return tx
-        
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
@@ -532,7 +482,7 @@ async def buy_with_jito(
     slippage_bps: int,
     tip_lamports: int,
 ) -> Tuple[str, VersionedTransaction]:
-    """Snipe a token with Helius backrun rebate (RPC mode) or Jito tip."""
+    """Snipe a token."""
     amount_lamports = int(sol_amount * 1e9)
     
     quote = await jupiter_quote(WSOL_MINT, mint, amount_lamports, slippage_bps)
@@ -540,10 +490,6 @@ async def buy_with_jito(
     swap_tx_bytes = base64.b64decode(tx_data["swapTransaction"])
     swap_tx = VersionedTransaction.from_bytes(swap_tx_bytes)
     swap_tx = sign_swap_transaction(swap_tx, wallet)
-    
-    # Add Helius backrun rebate (RPC mode only)
-    if SEND_MODE == "rpc":
-        swap_tx = add_backrun_rebate_instruction(swap_tx, wallet)
     
     blockhash_str = str(swap_tx.message.recent_blockhash)
 
@@ -566,16 +512,12 @@ async def sell_with_jito(
     slippage_bps: int,
     tip_lamports: int,
 ) -> Tuple[str, VersionedTransaction]:
-    """Sell tokens with Helius backrun rebate (RPC mode) or Jito tip."""
+    """Sell tokens."""
     quote = await jupiter_quote(mint, WSOL_MINT, token_amount, slippage_bps)
     tx_data = await jupiter_swap(quote, str(wallet.pubkey()))
     sell_tx_bytes = base64.b64decode(tx_data["swapTransaction"])
     sell_tx = VersionedTransaction.from_bytes(sell_tx_bytes)
     sell_tx = sign_swap_transaction(sell_tx, wallet)
-    
-    # Add Helius backrun rebate (RPC mode only)
-    if SEND_MODE == "rpc":
-        sell_tx = add_backrun_rebate_instruction(sell_tx, wallet)
     
     blockhash_str = str(sell_tx.message.recent_blockhash)
 
@@ -775,9 +717,9 @@ async def main():
     logger.info(f"RPC: {RPC_HTTP[:50]}...")
     logger.info(f"Snipe amount: {SNIPE_AMOUNT_SOL} SOL")
     logger.info(f"Gas reserve: {GAS_RESERVE_SOL} SOL")
-    logger.info(f"Jito tip: {TIP_LAMPORTS} lamports")
     logger.info(f"Send mode: {SEND_MODE}")
-    logger.info(f"Backrun rebate: {'Enabled' if ENABLE_BACKRUN_REBATE else 'Disabled'}")
+    if SEND_MODE == "jito":
+        logger.info(f"Jito tip: {TIP_LAMPORTS} lamports")
     logger.info("=" * 60)
 
     rpc = await create_rpc()
