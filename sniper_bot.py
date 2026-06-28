@@ -3,6 +3,7 @@
 Fully Automated Solana Meme-Sniping Bot
 Uses Jupiter API directly + Jito bundles for stealth execution.
 Smart exit: scaling out, trailing stop, market-cap & time failsafes.
+Peak-based take profit: sells when peak price hits target.
 Position persistence: survives restarts.
 Gas reserve: maintains minimum SOL balance to cover fees.
 Token age filter: only snipes tokens between MIN_TOKEN_AGE and MAX_TOKEN_AGE seconds old.
@@ -93,8 +94,8 @@ TIP_LAMPORTS = int(os.getenv("TIP_LAMPORTS", "500000"))
 MAX_RUGCHECK_RISK = int(os.getenv("MAX_RUGCHECK_RISK", "0"))
 
 # Token age filter (in seconds)
-MIN_TOKEN_AGE = int(os.getenv("MIN_TOKEN_AGE", "5"))      # Minimum 5 seconds old
-MAX_TOKEN_AGE = int(os.getenv("MAX_TOKEN_AGE", "300"))    # Maximum 5 minutes old
+MIN_TOKEN_AGE = int(os.getenv("MIN_TOKEN_AGE", "5"))
+MAX_TOKEN_AGE = int(os.getenv("MAX_TOKEN_AGE", "300"))
 
 # Gas reserve settings
 GAS_RESERVE_SOL = float(os.getenv("GAS_RESERVE_SOL", "0.01"))
@@ -103,7 +104,7 @@ GAS_PER_TX_ESTIMATE = 0.00005
 # Exit settings
 TARGET_MULTIPLES = [(2.0, 0.25), (3.0, 0.25), (5.0, 0.25)]
 TRAILING_STOP_PCT = 20.0
-STOP_LOSS_FACTOR = 0.4
+STOP_LOSS_FACTOR = 0.6   # Sell if value drops to 60% of buy price (max 40% loss)
 MAX_HOLD_SECONDS = 1200
 TARGET_MARKET_CAP = 1_000_000
 FORCE_SELL_TIMEOUT = 300
@@ -444,7 +445,7 @@ async def get_token_age(mint: str) -> Optional[float]:
 async def safety_check(mint: str, rpc: AsyncClient) -> bool:
     """Return True if token passes all checks including age filter."""
     
-    # 0. Token Age Check (NEW)
+    # 0. Token Age Check
     age = await get_token_age(mint)
     if age is not None:
         if age < MIN_TOKEN_AGE:
@@ -603,19 +604,30 @@ async def ultimate_exit_monitor(
     max_hold_seconds: int,
     target_mc: float,
 ):
-    """Smart exit strategy with force-sell fallback."""
+    """
+    Smart exit strategy with peak-based take profit.
+    - Uses PEAK price to trigger take profit (catches spikes between checks)
+    - Stop-loss at stop_loss_factor (default 0.6 = max 40% loss)
+    """
     start_time = time.time()
     remaining = initial_token_amount
     peak_sol = buy_price_sol
     last_successful_quote = time.time()
+    peak_reached_mult = 0  # Track highest multiple reached
 
     logger.info(f"🔍 Exit monitor STARTED for {mint[:8]}... ({remaining} tokens, bought at {buy_price_sol:.6f} SOL)")
 
     try:
         for mult, fraction in target_multiples:
+            # Skip targets already reached (from peak tracking)
+            if peak_reached_mult >= mult:
+                logger.info(f"Skipping {mult}x target - already reached {peak_reached_mult}x")
+                continue
+                
             while remaining > 0:
                 elapsed = time.time() - start_time
                 
+                # Time failsafe
                 if elapsed > max_hold_seconds:
                     logger.info(f"⏰ Time limit reached ({elapsed:.0f}s), selling remaining {remaining}")
                     try:
@@ -625,6 +637,7 @@ async def ultimate_exit_monitor(
                     remove_position(mint)
                     return
 
+                # Force sell if quotes fail for too long
                 if time.time() - last_successful_quote > FORCE_SELL_TIMEOUT:
                     logger.warning(f"⚠️ No successful quote for {FORCE_SELL_TIMEOUT}s, force selling!")
                     try:
@@ -634,6 +647,7 @@ async def ultimate_exit_monitor(
                     remove_position(mint)
                     return
 
+                # Price check
                 try:
                     quote = await jupiter_quote(mint, WSOL_MINT, remaining, slippage_bps)
                     current_sol = int(quote['outAmount']) / 1e9
@@ -643,14 +657,20 @@ async def ultimate_exit_monitor(
                     await asyncio.sleep(3)
                     continue
 
+                # Update peak
                 if current_sol > peak_sol:
                     peak_sol = current_sol
+                    current_multiple = peak_sol / buy_price_sol
+                    if current_multiple > peak_reached_mult:
+                        peak_reached_mult = current_multiple
+                        logger.info(f"🔺 New peak: {peak_sol:.6f} SOL ({current_multiple:.1f}x)")
 
-                logger.info(f"📊 {mint[:8]}... value: {current_sol:.6f} SOL | peak: {peak_sol:.6f} | "
-                           f"target: {buy_price_sol * mult:.6f} | stop: {buy_price_sol * stop_loss_factor:.6f}")
+                logger.info(f"📊 {mint[:8]}... value: {current_sol:.6f} SOL | peak: {peak_sol:.6f} ({peak_sol/buy_price_sol:.1f}x) | "
+                           f"target: {mult}x | stop: {buy_price_sol * stop_loss_factor:.6f}")
 
+                # Stop-loss: sell if value drops to stop_loss_factor of buy price (default 60% = max 40% loss)
                 if current_sol <= buy_price_sol * stop_loss_factor:
-                    logger.info(f"🛑 Stop-loss hit ({current_sol:.6f} SOL), selling all")
+                    logger.info(f"🛑 Stop-loss hit ({current_sol:.6f} SOL / {(current_sol/buy_price_sol)*100:.1f}% of buy), selling all")
                     try:
                         await sell_with_jito(mint, wallet, remaining, slippage_bps, tip_lamports)
                     except Exception as e:
@@ -658,22 +678,24 @@ async def ultimate_exit_monitor(
                     remove_position(mint)
                     return
 
-                if current_sol >= buy_price_sol * mult:
+                # Take profit using PEAK price (catches spikes between checks)
+                if peak_sol >= buy_price_sol * mult:
                     sell_amount = int(initial_token_amount * fraction)
                     sell_amount = min(sell_amount, remaining)
-                    logger.info(f"💰 Take profit: selling {fraction*100:.0f}% at {mult}x (value: {current_sol:.6f} SOL)")
+                    logger.info(f"💰 Take profit: PEAK hit {mult}x! Selling {fraction*100:.0f}% (peak: {peak_sol:.6f} SOL, current: {current_sol:.6f} SOL)")
                     try:
                         await sell_with_jito(mint, wallet, sell_amount, slippage_bps, tip_lamports)
                         remaining -= sell_amount
-                        peak_sol = current_sol
+                        peak_sol = current_sol  # Reset peak after partial sell
                     except Exception as e:
                         logger.error(f"Take-profit sell failed: {e}")
                     break
 
                 await asyncio.sleep(3)
 
+        # Moonbag trailing stop
         if remaining > 0:
-            logger.info(f"🌙 Moonbag trailing stop for {mint[:8]}... ({remaining} tokens)")
+            logger.info(f"🌙 Moonbag trailing stop for {mint[:8]}... ({remaining} tokens, peak: {peak_reached_mult:.1f}x)")
             while remaining > 0:
                 elapsed = time.time() - start_time
                 if elapsed > max_hold_seconds:
@@ -704,9 +726,11 @@ async def ultimate_exit_monitor(
 
                 if current_sol > peak_sol:
                     peak_sol = current_sol
+                    logger.info(f"🔺 Moonbag new peak: {peak_sol:.6f} SOL")
 
+                # Trailing stop: sell if drops 20% from peak
                 if current_sol <= peak_sol * (1 - trailing_stop_pct / 100):
-                    logger.info(f"📉 Trailing stop: peak {peak_sol:.6f}, current {current_sol:.6f}")
+                    logger.info(f"📉 Trailing stop: peak {peak_sol:.6f}, current {current_sol:.6f} (drop: {(1 - current_sol/peak_sol)*100:.1f}%)")
                     try:
                         await sell_with_jito(mint, wallet, remaining, slippage_bps, tip_lamports)
                     except Exception as e:
@@ -717,7 +741,7 @@ async def ultimate_exit_monitor(
                 await asyncio.sleep(3)
 
         remove_position(mint)
-        logger.info(f"✅ Exit monitor completed for {mint[:8]}...")
+        logger.info(f"✅ Exit monitor completed for {mint[:8]}... (peak reached: {peak_reached_mult:.1f}x)")
 
     except Exception as e:
         logger.error(f"💥 Exit monitor for {mint[:8]}... crashed: {e}", exc_info=True)
@@ -761,6 +785,8 @@ async def main():
     logger.info(f"Gas reserve: {GAS_RESERVE_SOL} SOL")
     logger.info(f"Send mode: {SEND_MODE}")
     logger.info(f"Token age filter: {MIN_TOKEN_AGE}s - {MAX_TOKEN_AGE}s")
+    logger.info(f"Stop-loss: at {STOP_LOSS_FACTOR*100:.0f}% of buy (max {(1-STOP_LOSS_FACTOR)*100:.0f}% loss)")
+    logger.info(f"Take profit: PEAK-based at {[f'{m}x' for m, _ in TARGET_MULTIPLES]}")
     if SEND_MODE == "jito":
         logger.info(f"Jito tip: {TIP_LAMPORTS} lamports")
     logger.info("=" * 60)
