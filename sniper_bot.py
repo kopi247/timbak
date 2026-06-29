@@ -2,11 +2,12 @@
 """
 Fully Automated Solana Meme-Sniping Bot
 BUY: 0.05 SOL | TAKE PROFIT: 1.7x | STOP LOSS: 40% max loss
-- Minimum 30s hold before any stop-loss
-- Requires 2 consecutive low readings for stop-loss confirmation
-- Stop-loss ALWAYS triggers on confirmed downtrend
-- Trailing stop only locks in profits (never sells below break-even)
-- Take profit always active (can trigger anytime)
+- Emergency DEX-agnostic sell: tries 10% → 50% → 99% slippage
+- Manual sell detection: stops monitoring if tokens are gone
+- Stop-loss retries forever until sold
+- Minimum 30s hold before stop-loss
+- 2-confirmation stop-loss
+- Trailing stop only above break-even
 """
 
 import asyncio
@@ -82,7 +83,7 @@ GAS_PER_TX_ESTIMATE = 0.00005
 
 # Exit settings
 TAKE_PROFIT_MULTIPLE = float(os.getenv("TAKE_PROFIT_MULTIPLE", "1.7"))
-STOP_LOSS_FACTOR = float(os.getenv("STOP_LOSS_FACTOR", "0.6"))  # Sell at 60% of buy = max 40% loss
+STOP_LOSS_FACTOR = float(os.getenv("STOP_LOSS_FACTOR", "0.6"))
 TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "30"))
 MAX_HOLD_SECONDS = int(os.getenv("MAX_HOLD_SECONDS", "600"))
 MIN_HOLD_SECONDS = int(os.getenv("MIN_HOLD_SECONDS", "30"))
@@ -215,6 +216,23 @@ async def send_tx(swap_tx: VersionedTransaction) -> str:
     return sig
 
 # ----------------------------------------------------------------------
+# Token Balance Check (for manual sell detection)
+# ----------------------------------------------------------------------
+
+async def check_token_balance(mint: str) -> int:
+    """Check if we still own tokens. Returns balance (0 if sold)."""
+    try:
+        rpc = await create_rpc()
+        from spl.token.instructions import get_associated_token_address
+        ata = get_associated_token_address(WALLET.pubkey(), Pubkey.from_string(mint))
+        resp = await rpc.get_token_account_balance(ata, commitment=Confirmed)
+        if resp.value is not None:
+            return int(resp.value.amount)
+    except Exception:
+        pass
+    return -1  # Error checking
+
+# ----------------------------------------------------------------------
 # Buy
 # ----------------------------------------------------------------------
 
@@ -236,25 +254,53 @@ async def buy_token(mint: str) -> Tuple[str, int]:
     return txid, token_amount
 
 # ----------------------------------------------------------------------
-# Sell
+# Emergency DEX-Agnostic Sell
 # ----------------------------------------------------------------------
 
 async def sell_token(mint: str, token_amount: int, reason: str = "") -> Tuple[str, float]:
-    """Sell tokens. Returns (txid, sol_received)."""
-    logger.info(f"💰 SELLING {token_amount} of {mint[:8]}... ({reason})")
+    """
+    Sell tokens with emergency fallback.
+    - Tries 10% slippage
+    - Tries 50% slippage
+    - Tries 99% slippage (market sell at any price)
+    """
+    slippage_levels = [
+        (SLIPPAGE_BPS, "normal"),
+        (5000, "high"),
+        (9900, "emergency market sell")
+    ]
     
-    quote = await jupiter_quote(mint, WSOL_MINT, token_amount, SLIPPAGE_BPS)
-    tx_data = await jupiter_swap(quote, str(WALLET.pubkey()))
-    sell_tx = VersionedTransaction.from_bytes(base64.b64decode(tx_data["swapTransaction"]))
-    sell_tx = sign_tx(sell_tx, WALLET)
+    for slippage, label in slippage_levels:
+        try:
+            logger.info(f"💰 SELL ({label}): {token_amount} of {mint[:8]}... (slippage: {slippage/100:.0f}%)")
+            
+            quote = await jupiter_quote(mint, WSOL_MINT, token_amount, slippage)
+            tx_data = await jupiter_swap(quote, str(WALLET.pubkey()))
+            sell_tx = VersionedTransaction.from_bytes(base64.b64decode(tx_data["swapTransaction"]))
+            sell_tx = sign_tx(sell_tx, WALLET)
+            
+            txid = await send_tx(sell_tx)
+            sol_received = int(quote['outAmount']) / 1e9
+            
+            profit = sol_received - SNIPE_AMOUNT_SOL - (GAS_PER_TX_ESTIMATE * 2)
+            logger.info(f"✅ SOLD! {sol_received:.6f} SOL | PnL: {profit:+.6f} SOL | TX: {txid[:30]}...")
+            
+            return txid, sol_received
+            
+        except Exception as e:
+            error_str = str(e).lower()
+            if "no route" in error_str or "liquidity" in error_str:
+                logger.warning(f"   No liquidity at {slippage/100:.0f}% slippage. Trying next level...")
+            elif "rate limited" in error_str:
+                logger.warning(f"   Rate limited. Waiting 5s...")
+                await asyncio.sleep(5)
+            else:
+                logger.warning(f"   Failed: {str(e)[:100]}")
+            
+            await asyncio.sleep(2)
     
-    txid = await send_tx(sell_tx)
-    sol_received = int(quote['outAmount']) / 1e9
-    
-    profit = sol_received - SNIPE_AMOUNT_SOL - (GAS_PER_TX_ESTIMATE * 2)
-    logger.info(f"✅ SOLD! {sol_received:.6f} SOL | PnL: {profit:+.6f} SOL | TX: {txid[:30]}...")
-    
-    return txid, sol_received
+    logger.error(f"❌ ALL SELL LEVELS FAILED for {mint[:8]}... Token appears illiquid.")
+    raise Exception(f"Cannot sell {mint[:8]} - no liquidity at any slippage level")
 
 # ----------------------------------------------------------------------
 # Safety Check
@@ -313,7 +359,6 @@ async def safety_check(mint: str) -> bool:
         mint_pub = Pubkey.from_string(mint)
         acc = await rpc.get_account_info(mint_pub, commitment=Confirmed)
         if acc.value is None:
-            logger.info(f"❌ Token not found on-chain")
             return False
         data = acc.value.data
         if len(data) < 4:
@@ -333,13 +378,10 @@ async def safety_check(mint: str) -> bool:
 async def monitor_and_sell(mint: str, token_amount: int, buy_price_sol: float):
     """
     Monitor price and execute sell strategy.
-    
-    RULES:
-    1. TAKE PROFIT: Always active. Sells instantly at target.
-    2. STOP LOSS: After MIN_HOLD_SECONDS, requires 2 consecutive low readings.
-       Once confirmed, SELLS RELENTLESSLY (retries on failure).
-    3. TRAILING STOP: Only above break-even. Locks in profits.
-    4. TIME LIMIT: Sells at market after MAX_HOLD_SECONDS.
+    - Detects manual sells (stops monitoring if tokens gone)
+    - Emergency sell: tries 10% → 50% → 99% slippage
+    - Stop-loss retries forever until sold
+    - Trailing stop only above break-even
     """
     start_time = time.time()
     peak_sol = buy_price_sol
@@ -347,23 +389,53 @@ async def monitor_and_sell(mint: str, token_amount: int, buy_price_sol: float):
     stop_sol = buy_price_sol * STOP_LOSS_FACTOR
     trailing_active = False
     low_readings = 0
+    stop_loss_triggered = False
     
     logger.info("=" * 50)
     logger.info(f"👁️ MONITORING {mint[:8]}...")
+    logger.info(f"   Tokens: {token_amount}")
     logger.info(f"   Buy: {buy_price_sol:.6f} SOL")
     logger.info(f"   Target: {TAKE_PROFIT_MULTIPLE}x = {target_sol:.6f} SOL")
-    logger.info(f"   Stop: {STOP_LOSS_FACTOR*100:.0f}% = {stop_sol:.6f} SOL (max {(1-STOP_LOSS_FACTOR)*100:.0f}% loss)")
+    logger.info(f"   Stop: {STOP_LOSS_FACTOR*100:.0f}% = {stop_sol:.6f} SOL")
     logger.info(f"   Min hold: {MIN_HOLD_SECONDS}s | Max hold: {MAX_HOLD_SECONDS}s")
+    logger.info(f"   Emergency sell: 10% → 50% → 99% slippage")
     logger.info("=" * 50)
     
     while True:
+        # ================================================================
+        # DETECT MANUAL SELL - Check if tokens still in wallet
+        # ================================================================
+        current_balance = await check_token_balance(mint)
+        if current_balance == 0:
+            logger.info(f"👋 Tokens for {mint[:8]}... are gone (manually sold or transferred). Stopping monitor.")
+            ACTIVE_MONITORS.pop(mint, None)
+            return
+        
+        # ================================================================
+        # STOP LOSS RETRY MODE - Keep trying to sell at any price
+        # ================================================================
+        if stop_loss_triggered:
+            logger.info(f"🔄 STOP LOSS RETRY: Attempting emergency sell of {mint[:8]}...")
+            try:
+                await sell_token(mint, token_amount, "stop loss emergency")
+                ACTIVE_MONITORS.pop(mint, None)
+                return
+            except Exception as e:
+                logger.error(f"Emergency sell failed: {str(e)[:100]}")
+                logger.info(f"Retrying in 15 seconds...")
+                await asyncio.sleep(15)
+                continue
+        
+        # ================================================================
+        # NORMAL MONITORING
+        # ================================================================
         elapsed = time.time() - start_time
         
         # --- TIME LIMIT ---
         if elapsed > MAX_HOLD_SECONDS:
-            logger.info(f"⏰ TIME LIMIT ({elapsed:.0f}s) - selling")
-            await sell_token(mint, token_amount, "time limit")
-            return
+            logger.info(f"⏰ TIME LIMIT ({elapsed:.0f}s) - triggering emergency sell")
+            stop_loss_triggered = True
+            continue
         
         # --- GET PRICE ---
         try:
@@ -383,25 +455,26 @@ async def monitor_and_sell(mint: str, token_amount: int, buy_price_sol: float):
         pm = peak_sol / buy_price_sol
         drop_from_peak = (1 - current_sol / peak_sol) * 100 if peak_sol > 0 else 0
         
-        # Status line
-        status = f"📊 {mint[:8]}... {current_sol:.6f} SOL ({cm:.2f}x)"
-        status += f" | peak: {pm:.2f}x"
-        status += f" | low reads: {low_readings}"
-        status += f" | trailing: {'ON' if trailing_active else 'off'}"
-        status += f" | elapsed: {elapsed:.0f}s"
-        logger.info(status)
+        # Status
+        logger.info(f"📊 {mint[:8]}... {cm:.2f}x | peak: {pm:.2f}x | low reads: {low_readings} | {elapsed:.0f}s")
         
         # ================================================================
-        # 1. TAKE PROFIT - Always active, instant sell
+        # TAKE PROFIT - Always active
         # ================================================================
         if current_sol >= target_sol:
             profit = current_sol - buy_price_sol - (GAS_PER_TX_ESTIMATE * 2)
             logger.info(f"💰💰💰 TAKE PROFIT! {cm:.2f}x! ~{profit:+.6f} SOL!")
-            await sell_token(mint, token_amount, f"take profit {cm:.2f}x")
-            return
+            try:
+                await sell_token(mint, token_amount, f"take profit {cm:.2f}x")
+                ACTIVE_MONITORS.pop(mint, None)
+                return
+            except Exception as e:
+                logger.error(f"Take profit sell failed: {e}")
+                stop_loss_triggered = True
+                continue
         
         # ================================================================
-        # 2. STOP LOSS - After hold period, 2-confirmation, relentless sell
+        # STOP LOSS - After hold period, 2-confirmation
         # ================================================================
         if elapsed >= MIN_HOLD_SECONDS:
             if current_sol <= stop_sol:
@@ -410,28 +483,16 @@ async def monitor_and_sell(mint: str, token_amount: int, buy_price_sol: float):
                 
                 if low_readings >= 2:
                     loss = buy_price_sol - current_sol
-                    logger.info(f"🛑🛑🛑 STOP LOSS CONFIRMED! Selling to protect capital! Loss: ~{loss:.6f} SOL")
-                    
-                    # Try to sell up to 5 times
-                    for sell_attempt in range(5):
-                        try:
-                            await sell_token(mint, token_amount, f"stop loss (attempt {sell_attempt+1})")
-                            return  # Success
-                        except Exception as e:
-                            logger.error(f"Sell attempt {sell_attempt+1} failed: {e}")
-                            if sell_attempt < 4:
-                                await asyncio.sleep(5)  # Wait before retry
-                    
-                    logger.error(f"❌ ALL SELL ATTEMPTS FAILED for stop-loss!")
-                    return  # Give up after 5 attempts
+                    logger.info(f"🛑🛑🛑 STOP LOSS CONFIRMED! Max loss: ~{loss:.6f} SOL. SELLING AT ANY PRICE!")
+                    stop_loss_triggered = True
+                    continue
             else:
-                # Price recovered above stop-loss, reset counter
                 if low_readings > 0:
-                    logger.info(f"✅ Price recovered above stop-loss, resetting counter")
+                    logger.info(f"✅ Price recovered above stop-loss")
                 low_readings = 0
         
         # ================================================================
-        # 3. TRAILING STOP - Only in profit zone
+        # TRAILING STOP - Only in profit zone
         # ================================================================
         if current_sol >= buy_price_sol * 1.05:
             trailing_active = True
@@ -440,8 +501,14 @@ async def monitor_and_sell(mint: str, token_amount: int, buy_price_sol: float):
             if drop_from_peak >= TRAILING_STOP_PCT:
                 profit = current_sol - buy_price_sol - (GAS_PER_TX_ESTIMATE * 2)
                 logger.info(f"📉 TRAILING STOP: -{drop_from_peak:.0f}% from peak | ~{profit:+.6f} SOL")
-                await sell_token(mint, token_amount, f"trailing stop")
-                return
+                try:
+                    await sell_token(mint, token_amount, "trailing stop")
+                    ACTIVE_MONITORS.pop(mint, None)
+                    return
+                except Exception as e:
+                    logger.error(f"Trailing stop sell failed: {e}")
+                    stop_loss_triggered = True
+                    continue
         
         await asyncio.sleep(PRICE_CHECK_SECONDS)
 
@@ -480,7 +547,8 @@ async def main():
     logger.info(f"Buy: {SNIPE_AMOUNT_SOL} SOL | Slippage: {SLIPPAGE_BPS/100:.0f}%")
     logger.info(f"Target: {TAKE_PROFIT_MULTIPLE}x | Stop: {(1-STOP_LOSS_FACTOR)*100:.0f}% max loss")
     logger.info(f"Stop requires: {MIN_HOLD_SECONDS}s hold + 2 confirmations")
-    logger.info(f"Trailing: {TRAILING_STOP_PCT}% drop from peak (above 1.05x only)")
+    logger.info(f"Emergency sell: 10% → 50% → 99% slippage")
+    logger.info(f"Manual sell detection: enabled")
     logger.info(f"Max hold: {MAX_HOLD_SECONDS}s")
     logger.info("=" * 60)
     
